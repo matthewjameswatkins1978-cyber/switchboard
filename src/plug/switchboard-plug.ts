@@ -1,6 +1,7 @@
+import crypto from 'node:crypto';
 import {
   SwitchboardClient,
-  FileClientStorage,
+  createClientStorage,
   type ClientStorage,
 } from '../client/switchboard-client.js';
 import type {
@@ -43,7 +44,9 @@ export interface PlugIdentifyResult {
   serverUrl: string;
   protocolVersion: number;
   storagePath: string;
+  storageType: 'sqlite' | 'file' | 'memory';
   hasToken: boolean;
+  tokenSha256?: string;
   stats: {
     outboxCount: number;
     inboxCount: number;
@@ -66,7 +69,7 @@ export class SwitchboardPlug {
 
   constructor(options?: Partial<PlugConfig>, storage?: ClientStorage) {
     this.config = resolvePlugConfig(options);
-    this.storage = storage ?? new FileClientStorage(this.config.storagePath);
+    this.storage = storage ?? createClientStorage(this.config.storagePath);
     this.client = new SwitchboardClient({
       baseUrl: this.config.baseUrl,
       token: this.config.token || '',
@@ -82,6 +85,10 @@ export class SwitchboardPlug {
    */
   identify(): PlugIdentifyResult {
     const stats = this.client.getStats();
+    const tokenSha256 = this.config.token
+      ? crypto.createHash('sha256').update(this.config.token).digest('hex')
+      : undefined;
+    const isSqlite = this.config.storagePath.endsWith('.sqlite') || this.config.storagePath.endsWith('.db');
     return {
       role: `${this.config.endpointId}/plug`,
       endpointId: this.config.endpointId,
@@ -90,7 +97,9 @@ export class SwitchboardPlug {
       serverUrl: this.config.baseUrl,
       protocolVersion: 1,
       storagePath: this.config.storagePath,
+      storageType: isSqlite ? 'sqlite' : 'file',
       hasToken: this.config.hasToken,
+      tokenSha256,
       stats,
     };
   }

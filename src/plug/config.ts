@@ -31,7 +31,7 @@ export function getDefaultConfigPath(): string {
 }
 
 export function getDefaultStoragePath(endpointId: string = DEFAULT_ENDPOINT_ID): string {
-  return path.join(getDefaultConfigDir(), `state-${endpointId}.json`);
+  return path.join(getDefaultConfigDir(), `state-${endpointId}.sqlite`);
 }
 
 export function loadPlugConfigFile(customPath?: string): Partial<PlugConfig> | null {

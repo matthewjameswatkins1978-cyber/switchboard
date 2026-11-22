@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { SwitchboardPlug } from './switchboard-plug.js';
 import { savePlugConfigFile, resolvePlugConfig } from './config.js';
 
@@ -246,16 +248,37 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
       const sub = args[1] || 'show';
       if (sub === 'show') {
         const resolved = resolvePlugConfig();
+        const tokenSha256 = resolved.token
+          ? crypto.createHash('sha256').update(resolved.token).digest('hex')
+          : undefined;
         const masked = {
-          ...resolved,
-          token: resolved.token ? `${resolved.token.slice(0, 4)}...${resolved.token.slice(-4)}` : undefined,
+          baseUrl: resolved.baseUrl,
+          endpointId: resolved.endpointId,
+          projectId: resolved.projectId,
+          storagePath: resolved.storagePath,
+          hasToken: resolved.hasToken,
+          token: resolved.token ? '[REDACTED: 256-bit credential present]' : undefined,
+          tokenSha256,
+          configPath: resolved.configPath,
         };
         console.log(JSON.stringify(masked, null, 2));
       } else if (sub === 'set') {
         const key = args[2];
-        const val = args[3];
+        let val = args[3];
+        if (key === 'token' && (val === '--stdin' || hasFlag('--stdin'))) {
+          try {
+            val = fs.readFileSync(0, 'utf8').trim();
+          } catch {
+            console.error('Failed to read token from stdin.');
+            process.exit(1);
+          }
+        } else if (key === 'token' && val) {
+          console.warn(
+            '[SECURITY NOTICE] Setting token via CLI arguments may expose secrets in process tables. Consider using stdin: sb config set token --stdin'
+          );
+        }
         if (!key || val === undefined) {
-          console.error('Usage: sb config set <key> <value>');
+          console.error('Usage: sb config set <key> <value> (or sb config set token --stdin)');
           process.exit(1);
         }
         const savedPath = savePlugConfigFile({ [key]: val });

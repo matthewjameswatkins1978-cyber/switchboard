@@ -67,11 +67,13 @@ describe('Switchboard Plug CLI Tests', () => {
     expect(inboxOutput.total).toBe(0);
   });
 
-  it('runs config show command and masks token', async () => {
+  it('runs config show command and redacts token while providing SHA-256 hash', async () => {
     process.env.SWITCHBOARD_TOKEN = 'secret-test-token-123456';
     await runCli(['config', 'show']);
     const configOutput = JSON.parse(logs[0]!);
     expect(configOutput.endpointId).toBe('cli-test-endpoint');
-    expect(configOutput.token).toBe('secr...3456');
+    expect(configOutput.token).toBe('[REDACTED: 256-bit credential present]');
+    expect(configOutput.tokenSha256).toBeDefined();
+    expect(configOutput.tokenSha256.length).toBe(64);
   });
 });

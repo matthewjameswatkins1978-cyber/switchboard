@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import type {
   OutgoingMessageInput,
   AckInput,
@@ -16,6 +17,13 @@ import type {
 } from '../core/types.js';
 import { calculateExponentialBackoffWithJitter, DEFAULT_TIMINGS } from '../core/timings.js';
 
+export function sanitizeErrorMessage(msg: string): string {
+  if (!msg || typeof msg !== 'string') return '';
+  return msg
+    .replace(/Bearer\s+[a-zA-Z0-9_\-.~+/=]+/gi, 'Bearer [REDACTED]')
+    .replace(/(token|key|secret)=([a-zA-Z0-9_\-.~+/=]+)/gi, '$1=[REDACTED]');
+}
+
 export interface ClientPersistedState {
   outbox: ClientOutboxItem[];
   pendingAcks: AckInput[];
@@ -29,6 +37,7 @@ export interface ClientPersistedState {
 export interface ClientStorage {
   load(): Promise<ClientPersistedState | null> | ClientPersistedState | null;
   save(state: ClientPersistedState): Promise<void> | void;
+  close?(): void;
 }
 
 export class MemoryClientStorage implements ClientStorage {
@@ -50,30 +59,154 @@ export class FileClientStorage implements ClientStorage {
     this.filePath = filePath;
   }
 
+  private withLock<T>(fn: () => T): T {
+    const lockDir = `${this.filePath}.lock`;
+    const timeout = Date.now() + 5000;
+    while (true) {
+      try {
+        fs.mkdirSync(lockDir);
+        break;
+      } catch (err: any) {
+        if (err.code === 'EEXIST') {
+          try {
+            const stat = fs.statSync(lockDir);
+            if (Date.now() - stat.mtimeMs > 10000) {
+              fs.rmdirSync(lockDir);
+              continue;
+            }
+          } catch {}
+          if (Date.now() > timeout) {
+            console.warn(`[FileClientStorage] Lock timeout on ${lockDir}, proceeding cautiously`);
+            break;
+          }
+          const start = Date.now();
+          while (Date.now() - start < 25) {}
+        } else {
+          break;
+        }
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {}
+    }
+  }
+
+  load(): ClientPersistedState | null {
+    return this.withLock(() => {
+      try {
+        if (fs.existsSync(this.filePath)) {
+          const raw = fs.readFileSync(this.filePath, 'utf8');
+          return JSON.parse(raw);
+        }
+      } catch (err) {
+        console.warn(`[FileClientStorage] Failed to read state file at ${this.filePath}:`, err);
+      }
+      return null;
+    });
+  }
+
+  save(state: ClientPersistedState): void {
+    this.withLock(() => {
+      try {
+        const dir = path.dirname(this.filePath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        const json = JSON.stringify(state, null, 2);
+        const tempPath = `${this.filePath}.${process.pid}.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
+        fs.writeFileSync(tempPath, json, 'utf8');
+        try {
+          fs.renameSync(tempPath, this.filePath);
+        } catch {
+          // Fallback if atomic rename fails on certain Windows file locks
+          fs.copyFileSync(tempPath, this.filePath);
+          try {
+            fs.unlinkSync(tempPath);
+          } catch {}
+        }
+      } catch (err) {
+        console.error(`[FileClientStorage] Failed to write state file at ${this.filePath}:`, err);
+      }
+    });
+  }
+}
+
+export class SqliteClientStorage implements ClientStorage {
+  private filePath: string;
+  private db: DatabaseSync;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    this.db = new DatabaseSync(filePath);
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS client_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        state_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  }
+
   load(): ClientPersistedState | null {
     try {
-      if (fs.existsSync(this.filePath)) {
-        const raw = fs.readFileSync(this.filePath, 'utf8');
-        return JSON.parse(raw);
+      const row = this.db.prepare('SELECT state_json FROM client_state WHERE id = 1').get() as
+        | { state_json: string }
+        | undefined;
+      if (row?.state_json) {
+        return JSON.parse(row.state_json);
       }
     } catch (err) {
-      console.warn(`[FileClientStorage] Failed to read state file at ${this.filePath}:`, err);
+      console.warn(`[SqliteClientStorage] Failed to read state from ${this.filePath}:`, err);
     }
     return null;
   }
 
   save(state: ClientPersistedState): void {
     try {
-      const dir = path.dirname(this.filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      const json = JSON.stringify(state);
+      const now = Date.now();
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO client_state (id, state_json, updated_at)
+             VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at`
+          )
+          .run(json, now);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
       }
-      const json = JSON.stringify(state, null, 2);
-      fs.writeFileSync(this.filePath, json, 'utf8');
     } catch (err) {
-      console.error(`[FileClientStorage] Failed to write state file at ${this.filePath}:`, err);
+      console.error(`[SqliteClientStorage] Failed to write state to ${this.filePath}:`, err);
     }
   }
+
+  close(): void {
+    try {
+      this.db.close();
+    } catch {}
+  }
+}
+
+export function createClientStorage(storagePath: string): ClientStorage {
+  if (storagePath.endsWith('.sqlite') || storagePath.endsWith('.db')) {
+    return new SqliteClientStorage(storagePath);
+  }
+  return new FileClientStorage(storagePath);
 }
 
 export interface ClientConfig {
@@ -520,7 +653,8 @@ export class SwitchboardClient {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error((err as any)?.error?.message ?? `Request failed: HTTP ${res.status}`);
+        const rawMsg = (err as any)?.error?.message ?? `Request failed: HTTP ${res.status}`;
+        throw new Error(sanitizeErrorMessage(rawMsg));
       }
 
       return res;
@@ -549,7 +683,8 @@ export class SwitchboardClient {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error((err as any)?.error?.message ?? `Send failed: HTTP ${res.status}`);
+        const rawMsg = (err as any)?.error?.message ?? `Send failed: HTTP ${res.status}`;
+        throw new Error(sanitizeErrorMessage(rawMsg));
       }
 
       return (await res.json()) as StoredReceipt;
@@ -612,7 +747,8 @@ export class SwitchboardClient {
 
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
-        const errMsg = (errJson as any)?.error?.message ?? `Sync failed: HTTP ${res.status}`;
+        const rawMsg = (errJson as any)?.error?.message ?? `Sync failed: HTTP ${res.status}`;
+        const errMsg = sanitizeErrorMessage(rawMsg);
         this.lastError = errMsg;
         this.consecutiveFailures++;
         throw new Error(errMsg);
