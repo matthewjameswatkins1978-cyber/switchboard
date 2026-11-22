@@ -21,7 +21,8 @@ export interface StoredMessage {
   kind: string;
   subject: string;
   payload: string; // JSON serialized string
-  payloadHash: string; // SHA-256
+  payloadHash: string; // SHA-256 of payload
+  envelopeHash: string; // SHA-256 of full immutable envelope
   priority: Priority;
   threadId: string | null;
   replyToId: string | null;

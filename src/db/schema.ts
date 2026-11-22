@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS messages (
   subject TEXT NOT NULL,
   payload TEXT NOT NULL,
   payload_hash TEXT NOT NULL,
+  envelope_hash TEXT NOT NULL,
   priority TEXT NOT NULL CHECK (priority IN ('urgent', 'normal', 'low')),
   thread_id TEXT,
   reply_to_id TEXT,

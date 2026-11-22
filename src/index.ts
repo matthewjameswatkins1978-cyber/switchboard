@@ -11,4 +11,5 @@ export * from './db/sqlite-adapter.js';
 export * from './db/d1-adapter.js';
 export * from './http/app.js';
 export * from './mcp/mcp-server.js';
+export * from './mcp/mcp-web-handler.js';
 export * from './client/switchboard-client.js';

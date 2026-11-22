@@ -28,6 +28,21 @@ import { sha256 } from '../auth/auth-service.js';
 import { calculateRecommendedNextSync, isPresenceStale } from './timings.js';
 import { MetricsCollector } from './metrics.js';
 
+export async function computeEnvelopeHash(input: OutgoingMessageInput): Promise<string> {
+  const canonical = JSON.stringify({
+    recipientType: input.recipientType,
+    recipientId: input.recipientId,
+    kind: input.kind,
+    subject: input.subject,
+    payload: input.payload ?? null,
+    priority: input.priority ?? 'normal',
+    threadId: input.threadId ?? null,
+    replyToId: input.replyToId ?? null,
+    evidenceRefs: input.evidenceRefs ?? null,
+  });
+  return await sha256(canonical);
+}
+
 export class SwitchboardService {
   private db: DatabaseSession;
   private metrics: MetricsCollector;
@@ -118,20 +133,22 @@ export class SwitchboardService {
     }
 
     const payloadHash = await sha256(payloadStr);
+    const envelopeHash = await computeEnvelopeHash(input);
 
     // 1. Check for existing message with (project_id, sender_id, id) for idempotency/conflict
     const existing = await tx.queryFirst<{
       id: string;
       payload_hash: string;
+      envelope_hash: string;
       created_at: number;
     }>(
-      `SELECT id, payload_hash, created_at FROM messages
+      `SELECT id, payload_hash, envelope_hash, created_at FROM messages
        WHERE project_id = ? AND sender_id = ? AND id = ?`,
       [principal.projectId, principal.endpointId, input.id]
     );
 
     if (existing) {
-      if (existing.payload_hash === payloadHash) {
+      if (existing.envelope_hash === envelopeHash) {
         // Idempotent duplicate: count deliveries and return stored receipt
         const countRow = await tx.queryFirst<{ cnt: number }>(
           `SELECT COUNT(*) as cnt FROM message_deliveries
@@ -148,24 +165,47 @@ export class SwitchboardService {
           isDuplicate: true,
         };
       } else {
-        // Conflict: same message ID with differing content
+        // Conflict: same message ID reused with differing envelope content
         throw new SwitchboardError(
           'CONFLICT',
-          `Message with id '${input.id}' already exists with differing payload content`
+          `Message with id '${input.id}' already exists with differing envelope content`
         );
       }
     }
 
-    // 2. Validate replyToId if provided
+    // 2. Validate replyToId and visibility if provided
     if (input.replyToId) {
-      const parent = await tx.queryFirst<{ id: string }>(
-        `SELECT id FROM messages WHERE project_id = ? AND id = ?`,
+      const parent = await tx.queryFirst<{
+        id: string;
+        sender_id: string;
+        recipient_type: string;
+        recipient_id: string;
+      }>(
+        `SELECT id, sender_id, recipient_type, recipient_id FROM messages WHERE project_id = ? AND id = ?`,
         [principal.projectId, input.replyToId]
       );
       if (!parent) {
         throw new SwitchboardError(
           'NOT_FOUND',
           `Referenced reply_to_id message '${input.replyToId}' was not found in this project`
+        );
+      }
+
+      let isVisible = false;
+      if (parent.sender_id === principal.endpointId || parent.recipient_id === principal.endpointId) {
+        isVisible = true;
+      } else if (parent.recipient_type === 'channel') {
+        const memberCheck = await tx.queryFirst<{ endpoint_id: string }>(
+          `SELECT endpoint_id FROM channel_members WHERE channel_id = ? AND endpoint_id = ?`,
+          [parent.recipient_id, principal.endpointId]
+        );
+        if (memberCheck) isVisible = true;
+      }
+
+      if (!isVisible) {
+        throw new SwitchboardError(
+          'FORBIDDEN',
+          `Referenced reply_to_id message '${input.replyToId}' is not accessible to sender`
         );
       }
     }
@@ -199,6 +239,18 @@ export class SwitchboardService {
       }
       channelId = input.recipientId;
 
+      // Verify sender is a member of the channel
+      const senderMember = await tx.queryFirst<{ endpoint_id: string }>(
+        `SELECT endpoint_id FROM channel_members WHERE channel_id = ? AND endpoint_id = ?`,
+        [channelId, principal.endpointId]
+      );
+      if (!senderMember) {
+        throw new SwitchboardError(
+          'FORBIDDEN',
+          `Sender '${principal.endpointId}' is not a member of channel '${channelId}'`
+        );
+      }
+
       // Atomic fanout resolution: resolve current members at acceptance time
       const members = await tx.query<{ endpoint_id: string }>(
         `SELECT endpoint_id FROM channel_members WHERE channel_id = ?`,
@@ -211,8 +263,8 @@ export class SwitchboardService {
     await tx.execute(
       `INSERT INTO messages
        (id, sender_id, project_id, recipient_type, recipient_id, kind, subject,
-        payload, payload_hash, priority, thread_id, reply_to_id, evidence_refs, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        payload, payload_hash, envelope_hash, priority, thread_id, reply_to_id, evidence_refs, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.id,
         principal.endpointId,
@@ -223,6 +275,7 @@ export class SwitchboardService {
         input.subject,
         payloadStr,
         payloadHash,
+        envelopeHash,
         input.priority ?? 'normal',
         input.threadId ?? null,
         input.replyToId ?? null,
@@ -840,7 +893,7 @@ export class SwitchboardService {
     const validated = StatusUpdateInputSchema.parse(input);
     const now = Date.now();
 
-    return await this.db.transaction(async (tx) => {
+    await this.db.transaction(async (tx) => {
       const existing = await tx.queryFirst<{ revision: number }>(
         `SELECT revision FROM endpoint_status WHERE endpoint_id = ? AND project_id = ?`,
         [principal.endpointId, principal.projectId]
@@ -878,9 +931,9 @@ export class SwitchboardService {
           principal.endpointId,
         ]
       );
-
-      return await this.getStatus(principal, principal.endpointId);
     });
+
+    return await this.getStatus(principal, principal.endpointId);
   }
 
   /**
@@ -983,7 +1036,7 @@ export class SwitchboardService {
     );
     const messages = await this.db.query<any>(
       `SELECT id, sender_id, project_id, recipient_type, recipient_id, kind, subject,
-              payload, payload_hash, priority, thread_id, reply_to_id, evidence_refs, created_at
+              payload, payload_hash, envelope_hash, priority, thread_id, reply_to_id, evidence_refs, created_at
        FROM messages WHERE project_id = ? ORDER BY internal_id ASC`,
       [principal.projectId]
     );
@@ -1027,6 +1080,7 @@ export class SwitchboardService {
         subject: m.subject,
         payload: m.payload,
         payloadHash: m.payload_hash,
+        envelopeHash: m.envelope_hash ?? m.payload_hash,
         priority: m.priority,
         threadId: m.thread_id,
         replyToId: m.reply_to_id,
@@ -1129,8 +1183,8 @@ export class SwitchboardService {
         await tx.execute(
           `INSERT OR REPLACE INTO messages
            (id, sender_id, project_id, recipient_type, recipient_id, kind, subject,
-            payload, payload_hash, priority, thread_id, reply_to_id, evidence_refs, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            payload, payload_hash, envelope_hash, priority, thread_id, reply_to_id, evidence_refs, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             m.id,
             m.senderId,
@@ -1141,6 +1195,7 @@ export class SwitchboardService {
             m.subject,
             m.payload,
             m.payloadHash,
+            m.envelopeHash ?? m.payloadHash,
             m.priority,
             m.threadId ?? null,
             m.replyToId ?? null,

@@ -5,6 +5,7 @@ import { AuthService } from '../auth/auth-service.js';
 import { SwitchboardService } from '../core/service.js';
 import { createSwitchboardApp } from '../http/app.js';
 import { mountMcpRoutes } from '../mcp/mcp-http-handler.js';
+import { mountWebMcpRoutes } from '../mcp/mcp-web-handler.js';
 
 export async function startServer(options?: {
   port?: number;
@@ -33,6 +34,7 @@ export async function startServer(options?: {
 
   const app = createSwitchboardApp({ authService, service });
   mountMcpRoutes(app, { authService, service });
+  mountWebMcpRoutes(app, { authService, service });
 
   const server = serve({
     fetch: app.fetch,

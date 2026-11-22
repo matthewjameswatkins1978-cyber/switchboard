@@ -139,13 +139,13 @@ export function createSwitchboardApp(deps: AppDependencies) {
     }
   });
 
-  // Metrics endpoint
+  // Metrics endpoint (authenticated)
   app.get('/metrics', async (c) => {
-    // Optionally allow token check or admin scope
     const authHeader = c.req.header('Authorization');
-    if (authHeader) {
-      await auth.authenticate(authHeader);
+    if (!authHeader) {
+      throw new SwitchboardError('UNAUTHORIZED', 'Missing Authorization header for metrics');
     }
+    await auth.authenticate(authHeader);
     return c.json(metrics.getSnapshot());
   });
 
