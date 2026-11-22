@@ -12,12 +12,15 @@ import {
   CreateChannelSchema,
 } from '../core/schema.js';
 import type { AuthPrincipal } from '../core/types.js';
+import { acceptsProtocol, PROTOCOL_HEADER, PROTOCOL_INFO } from '../operations/control.js';
 
 export interface AppDependencies {
   authService: AuthService;
   service: SwitchboardService;
   metrics?: MetricsCollector;
   rateLimitMaxPerMinute?: number;
+  paused?: boolean;
+  readiness?: () => Promise<boolean>;
 }
 
 export function createSwitchboardApp(deps: AppDependencies) {
@@ -26,6 +29,22 @@ export function createSwitchboardApp(deps: AppDependencies) {
   const svc = deps.service;
   const metrics = deps.metrics ?? MetricsCollector.getInstance();
   const rateLimitMax = deps.rateLimitMaxPerMinute ?? 600; // 600 req/min default
+
+  // Emergency brake applies before authorization and DB work, including MCP routes.
+  // It rejects work; it never deletes accepted deliveries or changes credentials.
+  app.use('*', async (c, next) => {
+    const path = c.req.path;
+    const discovery = path === '/api/v1/discovery';
+    if (deps.paused && path !== '/health' && !discovery) {
+      c.header('Retry-After', '120');
+      return c.json({ error: { code: 'UNAVAILABLE', message: 'Service paused by operator' } }, 503);
+    }
+    if (path.startsWith('/api/v1/') && !discovery && !acceptsProtocol(c.req.header(PROTOCOL_HEADER))) {
+      return c.json({ error: { code: 'UNSUPPORTED_PROTOCOL', message: 'Unsupported Switchboard protocol', supported: PROTOCOL_INFO.supported } }, 400);
+    }
+    await next();
+    return undefined;
+  });
 
   // In-memory rate limiting per principal
   const requestCounts = new Map<string, { count: number; resetAt: number }>();
@@ -70,6 +89,7 @@ export function createSwitchboardApp(deps: AppDependencies) {
     return c.json({
       status: 'ok',
       version: '0.1.0',
+      mode: deps.paused ? 'paused' : 'running',
       time: Date.now(),
     });
   });
@@ -79,6 +99,8 @@ export function createSwitchboardApp(deps: AppDependencies) {
     return c.json({
       name: 'Switchboard',
       version: '0.1.0',
+      protocol: PROTOCOL_INFO,
+      mode: deps.paused ? 'paused' : 'running',
       capabilities: {
         messaging: true,
         batchSync: true,
@@ -123,6 +145,20 @@ export function createSwitchboardApp(deps: AppDependencies) {
 
     return principal;
   }
+
+  // Authenticated readiness is separate from cheap public liveness. No background polling.
+  app.get('/api/v1/readiness', async (c) => {
+    try {
+      await requirePrincipal(c);
+    } catch (error) {
+      if (error instanceof SwitchboardError) throw error;
+      return c.json({ status: 'unavailable', ready: false }, 503);
+    }
+    let ready = false;
+    try { ready = (await deps.readiness?.()) === true; } catch { /* no sensitive error details */ }
+    c.header('Cache-Control', 'no-store');
+    return c.json({ status: ready ? 'ready' : 'unavailable', ready }, ready ? 200 : 503);
+  });
 
   // Work Board Human-facing Dashboard
   app.get('/board', async (c) => {
