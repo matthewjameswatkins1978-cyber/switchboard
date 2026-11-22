@@ -31,10 +31,12 @@ export interface BudgetReport {
 }
 
 export const DEFAULT_BUDGET_LIMITS: ProjectBudgetLimits = {
-  maxRequests: 5_000_000,
-  maxRowsWritten: 25_000_000,
-  maxStorageBytes: 2_500_000_000, // 2.5 GB
+  maxRequests: 3_000_000, // Cloudflare Workers Free: 100,000/day * 30 days
+  maxRowsWritten: 3_000_000, // Cloudflare D1 Free: 100,000/day * 30 days
+  maxStorageBytes: 500_000_000, // 500 MB safe D1 database allocation
 };
+
+export const CYCLE_DURATION_MS = 30 * 86_400_000; // 30-day accounting cycle
 
 export class BudgetManager {
   private static instance: BudgetManager;
@@ -70,11 +72,26 @@ export class BudgetManager {
       maxStorageBytes: row?.max_storage_bytes ?? DEFAULT_BUDGET_LIMITS.maxStorageBytes,
     };
 
-    const requestCount = row?.request_count ?? 0;
-    const rowsRead = row?.rows_read ?? 0;
-    const rowsWritten = row?.rows_written ?? 0;
+    let cycleStartAt = row?.cycle_start_at ?? now;
+    let requestCount = row?.request_count ?? 0;
+    let rowsRead = row?.rows_read ?? 0;
+    let rowsWritten = row?.rows_written ?? 0;
     const storageBytes = row?.storage_bytes ?? 0;
-    const cycleStartAt = row?.cycle_start_at ?? now;
+
+    // Automatic cycle rollover: reset accounting counters when period expires
+    if (now - cycleStartAt >= CYCLE_DURATION_MS) {
+      cycleStartAt = now;
+      requestCount = 0;
+      rowsRead = 0;
+      rowsWritten = 0;
+
+      await db.execute(
+        `UPDATE usage_accounting
+         SET cycle_start_at = ?, request_count = 0, rows_read = 0, rows_written = 0, updated_at = ?
+         WHERE project_id = ?`,
+        [now, now, projectId]
+      );
+    }
 
     const percentRequests = Math.round((requestCount / limits.maxRequests) * 100);
     const percentRowsWritten = Math.round((rowsWritten / limits.maxRowsWritten) * 100);
@@ -125,6 +142,21 @@ export class BudgetManager {
     const read = delta.rowsRead ?? 0;
     const written = delta.rowsWritten ?? 0;
     const storage = delta.storageBytes ?? 0;
+
+    // Check if existing accounting cycle has expired
+    const existing = await db.queryFirst<{ cycle_start_at: number }>(
+      `SELECT cycle_start_at FROM usage_accounting WHERE project_id = ?`,
+      [projectId]
+    );
+
+    if (existing && now - existing.cycle_start_at >= CYCLE_DURATION_MS) {
+      await db.execute(
+        `UPDATE usage_accounting
+         SET cycle_start_at = ?, request_count = 0, rows_read = 0, rows_written = 0, updated_at = ?
+         WHERE project_id = ?`,
+        [now, now, projectId]
+      );
+    }
 
     await db.execute(
       `INSERT INTO usage_accounting

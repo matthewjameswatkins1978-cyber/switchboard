@@ -417,6 +417,16 @@ export function createSwitchboardApp(deps: AppDependencies) {
     return c.json(result);
   });
 
+  app.post('/api/v1/admin/backups/restore-file', async (c) => {
+    const principal = await requirePrincipal(c);
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required');
+    }
+    const body = await c.req.json();
+    const result = await svc.importData(principal, body);
+    return c.json(result);
+  });
+
   // Budget
   app.get('/api/v1/budget', async (c) => {
     const principal = await requirePrincipal(c);

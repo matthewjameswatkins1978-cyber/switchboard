@@ -36,7 +36,7 @@ export class D1TransactionSession implements DatabaseSession {
     const normalized = sql.replace(/\s+/g, ' ').trim().toUpperCase();
 
     // 1. Transactional visibility: MAX(sequence)
-    if (normalized.includes('SELECT MAX(SEQUENCE)') && normalized.includes('FROM MESSAGE_DELIVERIES')) {
+    if (normalized.includes('MAX_SEQ') || (normalized.includes('MAX(SEQUENCE)') && normalized.includes('MESSAGE_DELIVERIES'))) {
       const stmt = this.d1.prepare(sql).bind(...params);
       const row = await stmt.first<any>();
       const dbMax = row?.max_seq ? Number(row.max_seq) : 0;
@@ -51,7 +51,7 @@ export class D1TransactionSession implements DatabaseSession {
     }
 
     // 2. Transactional visibility: messages check
-    if (normalized.startsWith('SELECT') && normalized.includes('FROM MESSAGES') && normalized.includes('PROJECT_ID =') && normalized.includes('SENDER_ID =') && normalized.includes('ID =')) {
+    if (normalized.includes('FROM MESSAGES') && normalized.includes('PROJECT_ID =') && normalized.includes('SENDER_ID =') && normalized.includes('ID =')) {
       const projectId = String(params[0] ?? '');
       const senderId = String(params[1] ?? '');
       const messageId = String(params[2] ?? '');
@@ -86,6 +86,17 @@ export class D1TransactionSession implements DatabaseSession {
       const projectId = String(params[0] ?? '');
       const recipientId = String(params[3] ?? '');
       const sequence = Number(params[5] ?? 0);
+      const key = `${projectId}:${recipientId}`;
+      const current = this.stagedMaxSequence.get(key) ?? 0;
+      if (sequence > current) {
+        this.stagedMaxSequence.set(key, sequence);
+      }
+    }
+
+    if (normalized.includes('ENDPOINT_SEQUENCES')) {
+      const projectId = String(params[0] ?? '');
+      const recipientId = String(params[1] ?? '');
+      const sequence = Number(params[2] ?? 0);
       const key = `${projectId}:${recipientId}`;
       const current = this.stagedMaxSequence.get(key) ?? 0;
       if (sequence > current) {

@@ -29,6 +29,8 @@ import { sha256 } from '../auth/auth-service.js';
 import { calculateRecommendedNextSync, isPresenceStale } from './timings.js';
 import { MetricsCollector } from './metrics.js';
 import { BudgetManager } from '../operations/budget.js';
+import type { BackupStorage } from '../operations/backup-storage.js';
+import { FileBackupStorage } from '../operations/backup-storage.js';
 
 export async function computeEnvelopeHash(input: OutgoingMessageInput): Promise<string> {
   const canonical = JSON.stringify({
@@ -48,10 +50,20 @@ export async function computeEnvelopeHash(input: OutgoingMessageInput): Promise<
 export class SwitchboardService {
   private db: DatabaseSession;
   private metrics: MetricsCollector;
+  private backupStorage?: BackupStorage;
 
-  constructor(db: DatabaseSession, metrics: MetricsCollector = MetricsCollector.getInstance()) {
+  constructor(
+    db: DatabaseSession,
+    metrics: MetricsCollector = MetricsCollector.getInstance(),
+    backupStorage?: BackupStorage
+  ) {
     this.db = db;
     this.metrics = metrics;
+    this.backupStorage =
+      backupStorage ??
+      (typeof process !== 'undefined' && process.release?.name === 'node'
+        ? new FileBackupStorage()
+        : undefined);
   }
 
   get database(): DatabaseSession {
@@ -149,7 +161,7 @@ export class SwitchboardService {
     const payloadHash = await sha256(payloadStr);
     const envelopeHash = await computeEnvelopeHash(input);
 
-    // 1. Check for existing message with (project_id, sender_id, id) for idempotency/conflict
+    // 1. Check for existing message with (project_id, sender_id, id) for idempotency/conflict across active AND archived messages
     const existing = await tx.queryFirst<{
       id: string;
       payload_hash: string;
@@ -157,17 +169,25 @@ export class SwitchboardService {
       created_at: number;
     }>(
       `SELECT id, payload_hash, envelope_hash, created_at FROM messages
+       WHERE project_id = ? AND sender_id = ? AND id = ?
+       UNION ALL
+       SELECT id, payload_hash, envelope_hash, created_at FROM archived_messages
        WHERE project_id = ? AND sender_id = ? AND id = ?`,
-      [principal.projectId, principal.endpointId, input.id]
+      [principal.projectId, principal.endpointId, input.id, principal.projectId, principal.endpointId, input.id]
     );
 
     if (existing) {
       if (existing.envelope_hash === envelopeHash) {
-        // Idempotent duplicate: count deliveries and return stored receipt
+        // Idempotent duplicate: count deliveries across active and archived deliveries
         const countRow = await tx.queryFirst<{ cnt: number }>(
-          `SELECT COUNT(*) as cnt FROM message_deliveries
-           WHERE project_id = ? AND sender_id = ? AND message_id = ?`,
-          [principal.projectId, principal.endpointId, input.id]
+          `SELECT COUNT(*) as cnt FROM (
+             SELECT id FROM message_deliveries
+             WHERE project_id = ? AND sender_id = ? AND message_id = ?
+             UNION ALL
+             SELECT id FROM archived_deliveries
+             WHERE project_id = ? AND sender_id = ? AND message_id = ?
+           )`,
+          [principal.projectId, principal.endpointId, input.id, principal.projectId, principal.endpointId, input.id]
         );
         this.metrics.recordDuplicateSuppressed();
         return {
@@ -187,7 +207,7 @@ export class SwitchboardService {
       }
     }
 
-    // 2. Validate replyToId and visibility if provided
+    // 2. Validate replyToId and visibility if provided (across active AND archived messages)
     if (input.replyToId) {
       const parent = await tx.queryFirst<{
         id: string;
@@ -195,8 +215,10 @@ export class SwitchboardService {
         recipient_type: string;
         recipient_id: string;
       }>(
-        `SELECT id, sender_id, recipient_type, recipient_id FROM messages WHERE project_id = ? AND id = ?`,
-        [principal.projectId, input.replyToId]
+        `SELECT id, sender_id, recipient_type, recipient_id FROM messages WHERE project_id = ? AND id = ?
+         UNION ALL
+         SELECT id, sender_id, recipient_type, recipient_id FROM archived_messages WHERE project_id = ? AND id = ?`,
+        [principal.projectId, input.replyToId, principal.projectId, input.replyToId]
       );
       if (!parent) {
         throw new SwitchboardError(
@@ -301,9 +323,21 @@ export class SwitchboardService {
     // 5. Create durable delivery records for each recipient endpoint with monotonic sequence
     for (const recipientId of recipientEndpoints) {
       const seqRow = await tx.queryFirst<{ max_seq: number | null }>(
-        `SELECT MAX(sequence) as max_seq FROM message_deliveries
-         WHERE project_id = ? AND recipient_id = ?`,
-        [principal.projectId, recipientId]
+        `SELECT MAX(seq) as max_seq FROM (
+           SELECT last_sequence as seq FROM endpoint_sequences
+           WHERE project_id = ? AND recipient_id = ?
+           UNION ALL
+           SELECT MAX(sequence) as seq FROM message_deliveries
+           WHERE project_id = ? AND recipient_id = ?
+           UNION ALL
+           SELECT MAX(sequence) as seq FROM archived_deliveries
+           WHERE project_id = ? AND recipient_id = ?
+         )`,
+        [
+          principal.projectId, recipientId,
+          principal.projectId, recipientId,
+          principal.projectId, recipientId,
+        ]
       );
       const nextSeq = (seqRow?.max_seq ?? 0) + 1;
 
@@ -312,6 +346,14 @@ export class SwitchboardService {
          (project_id, message_id, sender_id, recipient_id, channel_id, sequence, status, delivered_at)
          VALUES (?, ?, ?, ?, ?, ?, 'STORED', ?)`,
         [principal.projectId, input.id, principal.endpointId, recipientId, channelId, nextSeq, now]
+      );
+
+      await tx.execute(
+        `INSERT INTO endpoint_sequences (project_id, recipient_id, last_sequence)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_id, recipient_id) DO UPDATE SET
+           last_sequence = MAX(endpoint_sequences.last_sequence, excluded.last_sequence)`,
+        [principal.projectId, recipientId, nextSeq]
       );
     }
 
@@ -333,8 +375,6 @@ export class SwitchboardService {
     const start = Date.now();
     try {
       const validated = SyncRequestSchema.parse(request);
-      const hasUrgentOutbound = validated.outgoingMessages?.some((m) => m.priority === 'urgent') ?? false;
-      await BudgetManager.getInstance().enforceBudget(this.db, principal.projectId, hasUrgentOutbound);
       const budgetReport = await BudgetManager.getInstance().getReport(this.db, principal.projectId);
 
       const result = await this.db.transaction(async (tx) => {
@@ -345,6 +385,15 @@ export class SwitchboardService {
         // 1. Process outgoing messages
         if (validated.outgoingMessages && validated.outgoingMessages.length > 0) {
           for (const msg of validated.outgoingMessages) {
+            // Budget throttle only restricts non-urgent outgoing messages; inbound delivery and acks never blocked
+            if (budgetReport.status === 'EXCEEDED_100' && msg.priority !== 'urgent') {
+              errors.push({
+                id: msg.id,
+                code: 'THROTTLED',
+                message: `Monthly resource budget for project '${principal.projectId}' exceeded (${budgetReport.highestPercent}%). Throttling non-urgent operations.`,
+              });
+              continue;
+            }
             try {
               const receipt = await this.processSingleMessage(tx, principal, msg);
               storedReceipts.push(receipt);
@@ -748,7 +797,27 @@ export class SwitchboardService {
       queryParams.push(senderId);
     }
 
-    const row = await this.db.queryFirst<any>(sql, queryParams);
+    let row = await this.db.queryFirst<any>(sql, queryParams);
+    if (!row) {
+      let archSql = `
+        SELECT
+          m.id, m.sender_id, m.project_id, m.recipient_type, m.recipient_id,
+          m.kind, m.subject, m.payload, m.priority, m.thread_id, m.reply_to_id,
+          m.evidence_refs, m.created_at,
+          d.sequence, d.status, d.acknowledged_at
+        FROM archived_messages m
+        LEFT JOIN archived_deliveries d
+          ON d.project_id = m.project_id AND d.sender_id = m.sender_id AND d.message_id = m.id
+          AND d.recipient_id = ?
+        WHERE m.project_id = ? AND m.id = ?
+      `;
+      const archParams: any[] = [principal.endpointId, principal.projectId, messageId];
+      if (senderId) {
+        archSql += ` AND m.sender_id = ?`;
+        archParams.push(senderId);
+      }
+      row = await this.db.queryFirst<any>(archSql, archParams);
+    }
     if (!row) {
       throw new SwitchboardError('NOT_FOUND', `Message '${messageId}' not found`);
     }
@@ -1078,6 +1147,19 @@ export class SwitchboardService {
        FROM endpoint_status WHERE project_id = ?`,
       [principal.projectId]
     );
+    const archivedMessages = await this.db.query<any>(
+      `SELECT id, sender_id, project_id, recipient_type, recipient_id, kind, subject,
+              payload, payload_hash, envelope_hash, priority, thread_id, reply_to_id, evidence_refs, created_at, archived_at
+       FROM archived_messages WHERE project_id = ?`,
+      [principal.projectId]
+    );
+    const archivedDeliveries = await this.db.query<any>(
+      `SELECT id, project_id, message_id, sender_id, recipient_id, channel_id,
+              sequence, status, delivered_at, received_at, acknowledged_at, acknowledgement_note,
+              dead_letter_reason, dead_letter_at, archived_at
+       FROM archived_deliveries WHERE project_id = ?`,
+      [principal.projectId]
+    );
 
     const exportPayload: Omit<ExportData, 'checksumSha256'> = {
       version: '0.1.0',
@@ -1137,6 +1219,41 @@ export class SwitchboardService {
         lastHeartbeatAt: s.last_heartbeat_at,
         updatedAt: s.updated_at,
         updatedBy: s.updated_by,
+      })),
+      archivedMessages: archivedMessages.map((m) => ({
+        id: m.id,
+        senderId: m.sender_id,
+        projectId: m.project_id,
+        recipientType: m.recipient_type,
+        recipientId: m.recipient_id,
+        kind: m.kind,
+        subject: m.subject,
+        payload: m.payload,
+        payloadHash: m.payload_hash,
+        envelopeHash: m.envelope_hash ?? m.payload_hash,
+        priority: m.priority,
+        threadId: m.thread_id,
+        replyToId: m.reply_to_id,
+        evidenceRefs: m.evidence_refs ? JSON.parse(m.evidence_refs) : null,
+        createdAt: m.created_at,
+        archivedAt: m.archived_at,
+      })),
+      archivedDeliveries: archivedDeliveries.map((d) => ({
+        id: d.id,
+        projectId: d.project_id,
+        messageId: d.message_id,
+        senderId: d.sender_id,
+        recipientId: d.recipient_id,
+        channelId: d.channel_id,
+        sequence: d.sequence,
+        status: d.status,
+        deliveredAt: d.delivered_at,
+        receivedAt: d.received_at,
+        acknowledgedAt: d.acknowledged_at,
+        acknowledgementNote: d.acknowledgement_note,
+        deadLetterReason: d.dead_letter_reason,
+        deadLetterAt: d.dead_letter_at,
+        archivedAt: d.archived_at,
       })),
     };
 
@@ -1274,6 +1391,80 @@ export class SwitchboardService {
           ]
         );
       }
+
+      // 8. Archived Messages
+      if (data.archivedMessages) {
+        for (const m of data.archivedMessages) {
+          await tx.execute(
+            `INSERT OR REPLACE INTO archived_messages
+             (id, sender_id, project_id, recipient_type, recipient_id, kind, subject,
+              payload, payload_hash, envelope_hash, priority, thread_id, reply_to_id, evidence_refs, created_at, archived_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              m.id,
+              m.senderId,
+              m.projectId,
+              m.recipientType,
+              m.recipientId,
+              m.kind,
+              m.subject,
+              m.payload,
+              m.payloadHash,
+              m.envelopeHash ?? m.payloadHash,
+              m.priority,
+              m.threadId ?? null,
+              m.replyToId ?? null,
+              m.evidenceRefs ? JSON.stringify(m.evidenceRefs) : null,
+              m.createdAt,
+              (m as any).archivedAt ?? m.createdAt,
+            ]
+          );
+          count++;
+        }
+      }
+
+      // 9. Archived Deliveries
+      if (data.archivedDeliveries) {
+        for (const d of data.archivedDeliveries) {
+          await tx.execute(
+            `INSERT OR REPLACE INTO archived_deliveries
+             (id, project_id, message_id, sender_id, recipient_id, channel_id, sequence, status, delivered_at, received_at, acknowledged_at, acknowledgement_note, dead_letter_reason, dead_letter_at, archived_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              d.id,
+              d.projectId,
+              d.messageId,
+              d.senderId,
+              d.recipientId,
+              d.channelId ?? null,
+              d.sequence,
+              d.status,
+              d.deliveredAt,
+              d.receivedAt ?? null,
+              d.acknowledgedAt ?? null,
+              d.acknowledgementNote ?? null,
+              d.deadLetterReason ?? null,
+              d.deadLetterAt ?? null,
+              d.archivedAt ?? d.deliveredAt,
+            ]
+          );
+        }
+      }
+
+      // 10. Synchronize monotonic endpoint sequences watermark
+      await tx.execute(
+        `INSERT INTO endpoint_sequences (project_id, recipient_id, last_sequence)
+         SELECT project_id, recipient_id, MAX(sequence)
+         FROM (
+           SELECT project_id, recipient_id, sequence FROM message_deliveries WHERE project_id = ?
+           UNION ALL
+           SELECT project_id, recipient_id, sequence FROM archived_deliveries WHERE project_id = ?
+         )
+         GROUP BY project_id, recipient_id
+         ON CONFLICT(project_id, recipient_id) DO UPDATE SET
+           last_sequence = MAX(endpoint_sequences.last_sequence, excluded.last_sequence)`,
+        [data.projectId, data.projectId]
+      );
     });
 
     return { importedCount: count };
@@ -1535,13 +1726,7 @@ export class SwitchboardService {
     const now = Date.now();
     const manifestJson = JSON.stringify(exportData);
 
-    await this.db.execute(
-      `INSERT INTO backups (id, project_id, version, checksum_sha256, manifest_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [backupId, projectId, exportData.version, exportData.checksumSha256, manifestJson, now]
-    );
-
-    return {
+    const record: BackupRecord = {
       id: backupId,
       projectId,
       version: exportData.version,
@@ -1549,10 +1734,28 @@ export class SwitchboardService {
       manifestJson,
       createdAt: now,
     };
+
+    // 1. Primary database table backup
+    await this.db.execute(
+      `INSERT INTO backups (id, project_id, version, checksum_sha256, manifest_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [backupId, projectId, exportData.version, exportData.checksumSha256, manifestJson, now]
+    );
+
+    // 2. Recoverable external backup outside primary database
+    if (this.backupStorage) {
+      try {
+        await this.backupStorage.saveBackup(record);
+      } catch (err) {
+        console.warn('[Switchboard] External backup save warning:', err);
+      }
+    }
+
+    return record;
   }
 
   /**
-   * List recorded backups for project
+   * List recorded backups for project across DB and external storage
    */
   async listBackups(principal: AuthPrincipal): Promise<BackupRecord[]> {
     const rows = await this.db.query<{
@@ -1567,17 +1770,36 @@ export class SwitchboardService {
       [principal.projectId]
     );
 
-    return rows.map((r) => ({
-      id: r.id,
-      projectId: r.project_id,
-      version: r.version,
-      checksumSha256: r.checksum_sha256,
-      createdAt: r.created_at,
-    }));
+    const map = new Map<string, BackupRecord>();
+    for (const r of rows) {
+      map.set(r.id, {
+        id: r.id,
+        projectId: r.project_id,
+        version: r.version,
+        checksumSha256: r.checksum_sha256,
+        createdAt: r.created_at,
+      });
+    }
+
+    // Merge external backups outside primary database
+    if (this.backupStorage) {
+      try {
+        const external = await this.backupStorage.listBackups(principal.projectId);
+        for (const ext of external) {
+          if (!map.has(ext.id)) {
+            map.set(ext.id, ext);
+          }
+        }
+      } catch {
+        // Fall back to DB backups
+      }
+    }
+
+    return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt);
   }
 
   /**
-   * Restore database state from a backup
+   * Restore database state from a backup (supports DB record or external backup file)
    */
   async restoreFromBackup(
     principal: AuthPrincipal,
@@ -1587,16 +1809,30 @@ export class SwitchboardService {
       throw new SwitchboardError('FORBIDDEN', 'Admin privileges required to restore from backup');
     }
 
+    let manifestJson: string | null = null;
     const row = await this.db.queryFirst<{ manifest_json: string }>(
       `SELECT manifest_json FROM backups WHERE id = ? AND project_id = ?`,
       [backupId, principal.projectId]
     );
 
-    if (!row) {
-      throw new SwitchboardError('NOT_FOUND', `Backup '${backupId}' not found`);
+    if (row) {
+      manifestJson = row.manifest_json;
+    } else if (this.backupStorage) {
+      // Check external backup storage outside primary database
+      const ext = await this.backupStorage.loadBackup(backupId, principal.projectId);
+      if (ext?.manifestJson) {
+        manifestJson = ext.manifestJson;
+      }
     }
 
-    const parsed: ExportData = JSON.parse(row.manifest_json);
+    if (!manifestJson) {
+      throw new SwitchboardError(
+        'NOT_FOUND',
+        `Backup '${backupId}' not found in database or external storage`
+      );
+    }
+
+    const parsed: ExportData = JSON.parse(manifestJson);
     const result = await this.importData(principal, parsed);
 
     return {

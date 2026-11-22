@@ -33,6 +33,7 @@ export default {
     const service = new SwitchboardService(db);
     await runHousekeeping(db, {
       projectId: env.PROJECT_ID,
+      maxItemsPerRun: 500,
     });
     if (env.PROJECT_ID) {
       await service.createScheduledBackup(env.PROJECT_ID);

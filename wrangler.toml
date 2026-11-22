@@ -8,3 +8,6 @@ binding = "DB"
 database_name = "switchboard-db"
 database_id = "switchboard-local-id"
 migrations_dir = "src/db/migrations"
+
+[triggers]
+crons = ["0 * * * *"]

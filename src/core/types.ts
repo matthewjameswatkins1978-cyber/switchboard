@@ -173,5 +173,23 @@ export interface ExportData {
     acknowledgementNote: string | null;
   }>;
   statuses: EndpointStatusRecord[];
+  archivedMessages?: StoredMessage[];
+  archivedDeliveries?: Array<{
+    id: number;
+    projectId: string;
+    messageId: string;
+    senderId: string;
+    recipientId: string;
+    channelId: string | null;
+    sequence: number;
+    status: DeliveryStatus;
+    deliveredAt: number;
+    receivedAt: number | null;
+    acknowledgedAt: number | null;
+    acknowledgementNote: string | null;
+    deadLetterReason?: string | null;
+    deadLetterAt?: number | null;
+    archivedAt: number;
+  }>;
   checksumSha256: string;
 }

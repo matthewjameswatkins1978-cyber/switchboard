@@ -11,3 +11,5 @@ coverage/
 *.log
 .switchboard-telemetry/
 *.jsonl
+backups/
+.test-backups*/

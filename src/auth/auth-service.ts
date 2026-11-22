@@ -177,13 +177,45 @@ export class AuthService {
       // 2. Handle old token(s)
       if (options.oldToken) {
         const oldTokenHash = await sha256(options.oldToken);
+        const oldCred = await tx.queryFirst<{
+          revoked: number;
+          expires_at: number | null;
+        }>(
+          `SELECT revoked, expires_at FROM credentials
+           WHERE token_hash = ? AND endpoint_id = ? AND project_id = ?`,
+          [oldTokenHash, endpointId, projectId]
+        );
+
+        if (!oldCred) {
+          throw new SwitchboardError('UNAUTHORIZED', 'Invalid old credential for rotation');
+        }
+
+        if (oldCred.revoked === 1) {
+          throw new SwitchboardError(
+            'UNAUTHORIZED',
+            'Cannot rotate a revoked credential; revoked credentials cannot be reactivated'
+          );
+        }
+
+        if (oldCred.expires_at !== null && oldCred.expires_at <= now) {
+          throw new SwitchboardError(
+            'UNAUTHORIZED',
+            'Cannot rotate an expired credential; expired credentials cannot be reactivated'
+          );
+        }
+
         if (gracePeriodMs > 0) {
           const graceExpiresAt = now + gracePeriodMs;
+          const effectiveOldExpiresAt =
+            oldCred.expires_at !== null
+              ? Math.min(oldCred.expires_at, graceExpiresAt)
+              : graceExpiresAt;
+
           await tx.execute(
             `UPDATE credentials
-             SET expires_at = ?, revoked = 0
-             WHERE token_hash = ? AND endpoint_id = ? AND project_id = ?`,
-            [graceExpiresAt, oldTokenHash, endpointId, projectId]
+             SET expires_at = ?
+             WHERE token_hash = ? AND endpoint_id = ? AND project_id = ? AND revoked = 0`,
+            [effectiveOldExpiresAt, oldTokenHash, endpointId, projectId]
           );
         } else {
           await tx.execute(
@@ -198,16 +230,22 @@ export class AuthService {
           const graceExpiresAt = now + gracePeriodMs;
           await tx.execute(
             `UPDATE credentials
-             SET expires_at = CASE WHEN expires_at IS NULL OR expires_at > ? THEN ? ELSE expires_at END,
-                 revoked = 0
-             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?`,
-            [graceExpiresAt, graceExpiresAt, endpointId, projectId, newTokenHash]
+             SET expires_at = CASE
+               WHEN expires_at IS NULL THEN ?
+               WHEN expires_at > ? THEN ?
+               ELSE expires_at
+             END
+             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?
+               AND revoked = 0
+               AND (expires_at IS NULL OR expires_at > ?)`,
+            [graceExpiresAt, graceExpiresAt, graceExpiresAt, endpointId, projectId, newTokenHash, now]
           );
         } else {
           await tx.execute(
             `UPDATE credentials
              SET revoked = 1
-             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?`,
+             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?
+               AND revoked = 0`,
             [endpointId, projectId, newTokenHash]
           );
         }

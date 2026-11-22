@@ -139,6 +139,15 @@ CREATE TABLE IF NOT EXISTS archived_deliveries (
   archived_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_archived_deliveries_recipient_seq ON archived_deliveries(project_id, recipient_id, sequence);
+
+CREATE TABLE IF NOT EXISTS endpoint_sequences (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  recipient_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+  last_sequence INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, recipient_id)
+);
+
 CREATE TABLE IF NOT EXISTS backups (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -155,8 +164,8 @@ CREATE TABLE IF NOT EXISTS usage_accounting (
   rows_read INTEGER NOT NULL DEFAULT 0,
   rows_written INTEGER NOT NULL DEFAULT 0,
   storage_bytes INTEGER NOT NULL DEFAULT 0,
-  max_requests INTEGER NOT NULL DEFAULT 5000000,
-  max_rows_written INTEGER NOT NULL DEFAULT 25000000,
-  max_storage_bytes INTEGER NOT NULL DEFAULT 2500000000,
+  max_requests INTEGER NOT NULL DEFAULT 3000000,
+  max_rows_written INTEGER NOT NULL DEFAULT 3000000,
+  max_storage_bytes INTEGER NOT NULL DEFAULT 500000000,
   updated_at INTEGER NOT NULL
 );

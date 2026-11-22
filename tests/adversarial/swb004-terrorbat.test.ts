@@ -543,10 +543,16 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
 
   // 9. Real D1 Runtime Tests via Wrangler Local
   it('validates schema and D1 execution against wrangler local D1 runtime', () => {
-    const cmd = `npx wrangler d1 execute switchboard-db --local --command="SELECT COUNT(*) as tbl_count FROM sqlite_master WHERE type='table' AND name IN ('messages', 'message_deliveries', 'endpoint_status', 'archived_messages', 'archived_deliveries', 'backups', 'usage_accounting')"`;
+    // Ensure schema is self-contained and applied non-interactively
+    execSync(
+      `npx wrangler d1 execute switchboard-db --local --file=src/db/migrations/0001_initial_schema.sql --yes`,
+      { encoding: 'utf8', stdio: 'pipe' }
+    );
+
+    const cmd = `npx wrangler d1 execute switchboard-db --local --command="SELECT COUNT(*) as tbl_count FROM sqlite_master WHERE type='table' AND name IN ('messages', 'message_deliveries', 'endpoint_status', 'archived_messages', 'archived_deliveries', 'backups', 'usage_accounting', 'endpoint_sequences')" --yes`;
     const output = execSync(cmd, { encoding: 'utf8' });
 
     expect(output).toContain('executed successfully');
-    expect(output).toContain('"tbl_count": 7');
+    expect(output).toContain('"tbl_count": 8');
   });
 });

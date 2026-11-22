@@ -9,6 +9,7 @@ import { mountWebMcpRoutes } from '../mcp/mcp-web-handler.js';
 import { Telemetry, observeFetch } from '../telemetry/adapter.js';
 import { JsonlTransport } from '../telemetry/jsonl.js';
 import { checkReadiness, isPausedSetting } from '../operations/control.js';
+import { runHousekeeping } from '../operations/housekeeping.js';
 
 export async function startServer(options?: {
   port?: number;
@@ -17,6 +18,7 @@ export async function startServer(options?: {
   adminToken?: string;
   telemetryDirectory?: string;
   paused?: boolean;
+  housekeepingIntervalMs?: number;
 }) {
   const port = options?.port ?? Number(process.env.PORT ?? 3000);
   const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
@@ -64,6 +66,20 @@ export async function startServer(options?: {
       observer.emit('session.stopped');
       void observer.close();
     });
+  }
+
+  // Automatic bounded housekeeping for self-hosted Node profile
+  const housekeepingIntervalMs =
+    options?.housekeepingIntervalMs ??
+    Number(process.env.HOUSEKEEPING_INTERVAL_MS ?? 3600000);
+  if (housekeepingIntervalMs > 0) {
+    const housekeepingTimer = setInterval(() => {
+      runHousekeeping(db, { maxItemsPerRun: 1000 }).catch((err) => {
+        console.error('[Switchboard] Automatic housekeeping error:', err);
+      });
+    }, housekeepingIntervalMs);
+    if (housekeepingTimer.unref) housekeepingTimer.unref();
+    server.once('close', () => clearInterval(housekeepingTimer));
   }
 
   console.log(`[Switchboard] Listening on http://${host}:${port}`);
