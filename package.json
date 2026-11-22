@@ -1,0 +1,48 @@
+{
+  "name": "switchboard",
+  "version": "0.1.0",
+  "description": "Lean, dependable communication infrastructure for AI agents and ordinary programs.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/switchboard-client.d.ts",
+      "import": "./dist/client/switchboard-client.js"
+    }
+  },
+  "bin": {
+    "switchboard": "./dist/server/node-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/server/node-server.js",
+    "dev": "tsx watch src/server/node-server.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matthewjameswatkins1978-cyber/switchboard.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.19",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20261119.0",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.19.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1",
+    "wrangler": "^3.114.0"
+  }
+}
