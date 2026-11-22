@@ -1,7 +1,7 @@
 export type Priority = 'urgent' | 'normal' | 'low';
 export type RecipientType = 'endpoint' | 'channel';
-export type DeliveryStatus = 'STORED' | 'RECEIVED' | 'ACKNOWLEDGED';
-export type EndpointState = 'available' | 'busy' | 'waiting' | 'stale' | 'offline';
+export type DeliveryStatus = 'STORED' | 'RECEIVED' | 'ACKNOWLEDGED' | 'DEAD_LETTER';
+export type EndpointState = 'available' | 'busy' | 'waiting' | 'stale' | 'offline' | 'retired';
 export type EndpointRole = 'agent' | 'service' | 'human' | 'admin';
 
 export interface AuthPrincipal {
@@ -47,6 +47,17 @@ export interface MessageEnvelope {
   deliverySequence: number;
   deliveryStatus: DeliveryStatus;
   acknowledgedAt?: number | null;
+  deadLetterReason?: string | null;
+  deadLetterAt?: number | null;
+}
+
+export interface BackupRecord {
+  id: string;
+  projectId: string;
+  version: string;
+  checksumSha256: string;
+  manifestJson?: string;
+  createdAt: number;
 }
 
 export interface StoredReceipt {

@@ -1,10 +1,15 @@
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSession, ExecResult } from './database.js';
+
+interface TxContext {
+  depth: number;
+}
 
 export class SqliteAdapter implements DatabaseSession {
   private db: DatabaseSync;
   private transactionMutex: Promise<void> = Promise.resolve();
-  private activeTransactionDepth = 0;
+  private txStorage = new AsyncLocalStorage<TxContext>();
 
   constructor(location: string = ':memory:') {
     this.db = new DatabaseSync(location);
@@ -54,10 +59,11 @@ export class SqliteAdapter implements DatabaseSession {
   }
 
   async transaction<T>(fn: (tx: DatabaseSession) => Promise<T>): Promise<T> {
-    if (this.activeTransactionDepth > 0) {
-      // True nested transaction using SQLite SAVEPOINT
-      const spName = `sp_${this.activeTransactionDepth}`;
-      this.activeTransactionDepth++;
+    const context = this.txStorage.getStore();
+    if (context) {
+      // True nested transaction using SQLite SAVEPOINT within the same execution context
+      const spName = `sp_${context.depth}`;
+      context.depth++;
       this.db.exec(`SAVEPOINT ${spName}`);
       try {
         const result = await fn(this);
@@ -72,17 +78,16 @@ export class SqliteAdapter implements DatabaseSession {
         }
         throw err;
       } finally {
-        this.activeTransactionDepth--;
+        context.depth--;
       }
     }
 
     // Top-level transaction: acquire mutex to serialize concurrent transaction calls
     const releaseLock = await this.acquireLock();
-    this.activeTransactionDepth = 1;
     this.db.exec('BEGIN IMMEDIATE');
 
     try {
-      const result = await fn(this);
+      const result = await this.txStorage.run({ depth: 1 }, () => fn(this));
       this.db.exec('COMMIT');
       return result;
     } catch (err) {
@@ -93,7 +98,6 @@ export class SqliteAdapter implements DatabaseSession {
       }
       throw err;
     } finally {
-      this.activeTransactionDepth = 0;
       releaseLock();
     }
   }

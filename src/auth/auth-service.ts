@@ -133,4 +133,87 @@ export class AuthService {
     const tokenHash = await sha256(rawToken);
     await this.db.execute(`UPDATE credentials SET revoked = 1 WHERE token_hash = ?`, [tokenHash]);
   }
+
+  async rotateToken(
+    projectId: string,
+    endpointId: string,
+    newToken: string,
+    options: {
+      oldToken?: string;
+      gracePeriodMs?: number;
+      scopes?: string[];
+      newExpiresInMs?: number;
+    } = {}
+  ): Promise<{ endpointId: string; status: 'rotated'; gracePeriodMs: number }> {
+    const now = Date.now();
+    const gracePeriodMs = options.gracePeriodMs ?? 0;
+    const newTokenHash = await sha256(newToken);
+    const newExpiresAt = options.newExpiresInMs ? now + options.newExpiresInMs : null;
+    const scopes = options.scopes ?? ['read', 'write'];
+
+    await this.db.transaction(async (tx) => {
+      const endpoint = await tx.queryFirst<{ id: string }>(
+        `SELECT id FROM endpoints WHERE id = ? AND project_id = ?`,
+        [endpointId, projectId]
+      );
+      if (!endpoint) {
+        throw new SwitchboardError(
+          'NOT_FOUND',
+          `Endpoint '${endpointId}' not found in project '${projectId}'`
+        );
+      }
+
+      // 1. Issue new token
+      await tx.execute(
+        `INSERT INTO credentials (token_hash, endpoint_id, project_id, scopes, expires_at, revoked, created_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?)
+         ON CONFLICT(token_hash) DO UPDATE SET
+           scopes = excluded.scopes,
+           expires_at = excluded.expires_at,
+           revoked = 0`,
+        [newTokenHash, endpointId, projectId, JSON.stringify(scopes), newExpiresAt, now]
+      );
+
+      // 2. Handle old token(s)
+      if (options.oldToken) {
+        const oldTokenHash = await sha256(options.oldToken);
+        if (gracePeriodMs > 0) {
+          const graceExpiresAt = now + gracePeriodMs;
+          await tx.execute(
+            `UPDATE credentials
+             SET expires_at = ?, revoked = 0
+             WHERE token_hash = ? AND endpoint_id = ? AND project_id = ?`,
+            [graceExpiresAt, oldTokenHash, endpointId, projectId]
+          );
+        } else {
+          await tx.execute(
+            `UPDATE credentials
+             SET revoked = 1
+             WHERE token_hash = ? AND endpoint_id = ? AND project_id = ?`,
+            [oldTokenHash, endpointId, projectId]
+          );
+        }
+      } else {
+        if (gracePeriodMs > 0) {
+          const graceExpiresAt = now + gracePeriodMs;
+          await tx.execute(
+            `UPDATE credentials
+             SET expires_at = CASE WHEN expires_at IS NULL OR expires_at > ? THEN ? ELSE expires_at END,
+                 revoked = 0
+             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?`,
+            [graceExpiresAt, graceExpiresAt, endpointId, projectId, newTokenHash]
+          );
+        } else {
+          await tx.execute(
+            `UPDATE credentials
+             SET revoked = 1
+             WHERE endpoint_id = ? AND project_id = ? AND token_hash != ?`,
+            [endpointId, projectId, newTokenHash]
+          );
+        }
+      }
+    });
+
+    return { endpointId, status: 'rotated', gracePeriodMs };
+  }
 }

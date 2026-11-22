@@ -14,7 +14,7 @@ export const PrioritySchema = z.enum(['urgent', 'normal', 'low']).default('norma
 
 export const RecipientTypeSchema = z.enum(['endpoint', 'channel']);
 
-export const EndpointStateSchema = z.enum(['available', 'busy', 'waiting', 'stale', 'offline']);
+export const EndpointStateSchema = z.enum(['available', 'busy', 'waiting', 'stale', 'offline', 'retired']);
 
 export const EndpointRoleSchema = z.enum(['agent', 'service', 'human', 'admin']);
 

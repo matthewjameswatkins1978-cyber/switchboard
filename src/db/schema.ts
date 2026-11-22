@@ -70,11 +70,13 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
   recipient_id TEXT NOT NULL REFERENCES endpoints(id),
   channel_id TEXT REFERENCES channels(id),
   sequence INTEGER NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('STORED', 'RECEIVED', 'ACKNOWLEDGED')),
+  status TEXT NOT NULL CHECK (status IN ('STORED', 'RECEIVED', 'ACKNOWLEDGED', 'DEAD_LETTER')),
   delivered_at INTEGER NOT NULL,
   received_at INTEGER,
   acknowledged_at INTEGER,
   acknowledgement_note TEXT,
+  dead_letter_reason TEXT,
+  dead_letter_at INTEGER,
   UNIQUE (project_id, recipient_id, sequence),
   UNIQUE (project_id, sender_id, message_id, recipient_id)
 );
@@ -85,7 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_recipient_seq ON message_deliveries(pr
 CREATE TABLE IF NOT EXISTS endpoint_status (
   endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  state TEXT NOT NULL CHECK (state IN ('available', 'busy', 'waiting', 'stale', 'offline')),
+  state TEXT NOT NULL CHECK (state IN ('available', 'busy', 'waiting', 'stale', 'offline', 'retired')),
   description TEXT,
   revision INTEGER NOT NULL DEFAULT 1,
   last_heartbeat_at INTEGER NOT NULL,
@@ -100,6 +102,66 @@ CREATE TABLE IF NOT EXISTS audit_log (
   action TEXT NOT NULL,
   details TEXT,
   created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archived_messages (
+  id TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  recipient_type TEXT NOT NULL,
+  recipient_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  envelope_hash TEXT NOT NULL,
+  priority TEXT NOT NULL,
+  thread_id TEXT,
+  reply_to_id TEXT,
+  evidence_refs TEXT,
+  created_at INTEGER NOT NULL,
+  archived_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, sender_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS archived_deliveries (
+  id INTEGER PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  recipient_id TEXT NOT NULL,
+  channel_id TEXT,
+  sequence INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  delivered_at INTEGER NOT NULL,
+  received_at INTEGER,
+  acknowledged_at INTEGER,
+  acknowledgement_note TEXT,
+  dead_letter_reason TEXT,
+  dead_letter_at INTEGER,
+  archived_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS backups (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  version TEXT NOT NULL,
+  checksum_sha256 TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS usage_accounting (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_start_at INTEGER NOT NULL,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  rows_read INTEGER NOT NULL DEFAULT 0,
+  rows_written INTEGER NOT NULL DEFAULT 0,
+  storage_bytes INTEGER NOT NULL DEFAULT 0,
+  max_requests INTEGER NOT NULL DEFAULT 5000000,
+  max_rows_written INTEGER NOT NULL DEFAULT 25000000,
+  max_storage_bytes INTEGER NOT NULL DEFAULT 2500000000,
+  updated_at INTEGER NOT NULL
 );
 `;
 

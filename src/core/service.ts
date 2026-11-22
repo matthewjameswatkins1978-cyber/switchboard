@@ -14,6 +14,7 @@ import type {
   ExportData,
   DeliveryStatus,
   SyncItemError,
+  BackupRecord,
 } from './types.js';
 import { SwitchboardError } from './errors.js';
 import {
@@ -27,6 +28,7 @@ import {
 import { sha256 } from '../auth/auth-service.js';
 import { calculateRecommendedNextSync, isPresenceStale } from './timings.js';
 import { MetricsCollector } from './metrics.js';
+import { BudgetManager } from '../operations/budget.js';
 
 export async function computeEnvelopeHash(input: OutgoingMessageInput): Promise<string> {
   const canonical = JSON.stringify({
@@ -50,6 +52,10 @@ export class SwitchboardService {
   constructor(db: DatabaseSession, metrics: MetricsCollector = MetricsCollector.getInstance()) {
     this.db = db;
     this.metrics = metrics;
+  }
+
+  get database(): DatabaseSession {
+    return this.db;
   }
 
   /**
@@ -94,6 +100,9 @@ export class SwitchboardService {
     const start = Date.now();
     try {
       const validated = OutgoingMessageInputSchema.parse(input);
+      const isUrgent = validated.priority === 'urgent';
+      await BudgetManager.getInstance().enforceBudget(this.db, principal.projectId, isUrgent);
+
       const receipt = await this.db.transaction(async (tx) => {
         return await this.processSingleMessage(tx, principal, validated);
       });
@@ -102,6 +111,11 @@ export class SwitchboardService {
         operation: 'send_message',
         outcome: 'success',
         durationMs: Date.now() - start,
+        rowsWritten: receipt.recipientCount + 1,
+      });
+
+      await BudgetManager.getInstance().recordUsage(this.db, principal.projectId, {
+        requests: 1,
         rowsWritten: receipt.recipientCount + 1,
       });
 
@@ -319,6 +333,9 @@ export class SwitchboardService {
     const start = Date.now();
     try {
       const validated = SyncRequestSchema.parse(request);
+      const hasUrgentOutbound = validated.outgoingMessages?.some((m) => m.priority === 'urgent') ?? false;
+      await BudgetManager.getInstance().enforceBudget(this.db, principal.projectId, hasUrgentOutbound);
+      const budgetReport = await BudgetManager.getInstance().getReport(this.db, principal.projectId);
 
       const result = await this.db.transaction(async (tx) => {
         const storedReceipts: StoredReceipt[] = [];
@@ -527,12 +544,16 @@ export class SwitchboardService {
           [principal.endpointId, principal.projectId]
         );
 
-        const recommendedNextSyncMs = calculateRecommendedNextSync({
+        const baseRecommendedNextSyncMs = calculateRecommendedNextSync({
           endpointState: statusRecord?.state ?? 'available',
           hasUrgentActivity: hasUrgentInbound || hasUrgentOutbound,
           hasUnreadMessages: inboundMessages.length > 0,
           now,
         });
+
+        const recommendedNextSyncMs = Math.round(
+          baseRecommendedNextSyncMs * budgetReport.cadenceMultiplier
+        );
 
         const nextCursor = this.encodeCursor(maxSeqSeen);
 
@@ -552,6 +573,12 @@ export class SwitchboardService {
         operation: 'sync',
         outcome: 'success',
         durationMs: Date.now() - start,
+        rowsRead: result.inboundMessages.length,
+        rowsWritten: result.storedReceipts.length + result.acknowledgedReceipts.length,
+      });
+
+      await BudgetManager.getInstance().recordUsage(this.db, principal.projectId, {
+        requests: 1,
         rowsRead: result.inboundMessages.length,
         rowsWritten: result.storedReceipts.length + result.acknowledgedReceipts.length,
       });
@@ -1311,5 +1338,270 @@ export class SwitchboardService {
        VALUES (?, ?, ?)`,
       [channelId, endpointId, Date.now()]
     );
+  }
+
+  /**
+   * Bounded view of dead-lettered deliveries
+   */
+  async getDeadLetters(
+    principal: AuthPrincipal,
+    options?: { limit?: number; offset?: number }
+  ): Promise<{ deadLetters: MessageEnvelope[]; total: number }> {
+    const limit = Math.min(options?.limit ?? MAX_BATCH_MESSAGES, MAX_BATCH_MESSAGES);
+    const offset = options?.offset ?? 0;
+
+    let totalSql = `SELECT COUNT(*) as cnt FROM message_deliveries WHERE project_id = ? AND status = 'DEAD_LETTER'`;
+    let querySql = `
+      SELECT
+        m.id, m.sender_id, m.project_id, m.recipient_type, m.recipient_id,
+        m.kind, m.subject, m.payload, m.priority, m.thread_id, m.reply_to_id,
+        m.evidence_refs, m.created_at,
+        d.sequence, d.status, d.acknowledged_at, d.dead_letter_reason, d.dead_letter_at
+      FROM message_deliveries d
+      JOIN messages m ON d.project_id = m.project_id AND d.sender_id = m.sender_id AND d.message_id = m.id
+      WHERE d.project_id = ? AND d.status = 'DEAD_LETTER'
+    `;
+    const params: unknown[] = [principal.projectId];
+    if (principal.role !== 'admin') {
+      totalSql += ` AND (recipient_id = ? OR sender_id = ?)`;
+      querySql += ` AND (d.recipient_id = ? OR d.sender_id = ?)`;
+      params.push(principal.endpointId, principal.endpointId);
+    }
+
+    const totalRow = await this.db.queryFirst<{ cnt: number }>(totalSql, params);
+
+    querySql += ` ORDER BY d.sequence DESC LIMIT ? OFFSET ?`;
+    const queryParams = [...params, limit, offset];
+    const rows = await this.db.query<any>(querySql, queryParams);
+
+    const deadLetters: MessageEnvelope[] = rows.map((r) => {
+      let payload: unknown = null;
+      try {
+        payload = JSON.parse(r.payload);
+      } catch {
+        payload = r.payload;
+      }
+      return {
+        id: r.id,
+        senderId: r.sender_id,
+        projectId: r.project_id,
+        recipientType: r.recipient_type,
+        recipientId: r.recipient_id,
+        kind: r.kind,
+        subject: r.subject,
+        payload,
+        priority: r.priority,
+        threadId: r.thread_id,
+        replyToId: r.reply_to_id,
+        evidenceRefs: r.evidence_refs ? JSON.parse(r.evidence_refs) : null,
+        serverCreatedAt: r.created_at,
+        deliverySequence: r.sequence,
+        deliveryStatus: r.status,
+        acknowledgedAt: r.acknowledged_at,
+        deadLetterReason: r.dead_letter_reason,
+        deadLetterAt: r.dead_letter_at,
+      };
+    });
+
+    return {
+      deadLetters,
+      total: totalRow?.cnt ?? 0,
+    };
+  }
+
+  /**
+   * Requeue a dead-lettered delivery for redelivery
+   */
+  async requeueDeadLetter(
+    principal: AuthPrincipal,
+    deliveryId: number | string
+  ): Promise<{ success: boolean; deliveryId: number; status: 'STORED' }> {
+    const delivery = await this.db.queryFirst<{
+      id: number;
+      project_id: string;
+      sender_id: string;
+      recipient_id: string;
+      status: string;
+    }>(
+      `SELECT id, project_id, sender_id, recipient_id, status FROM message_deliveries WHERE id = ? AND project_id = ?`,
+      [deliveryId, principal.projectId]
+    );
+
+    if (!delivery) {
+      throw new SwitchboardError('NOT_FOUND', `Delivery '${deliveryId}' not found`);
+    }
+
+    if (delivery.status !== 'DEAD_LETTER') {
+      throw new SwitchboardError(
+        'INVALID_INPUT',
+        `Delivery '${deliveryId}' is in status '${delivery.status}', cannot requeue unless DEAD_LETTER`
+      );
+    }
+
+    if (
+      principal.role !== 'admin' &&
+      principal.endpointId !== delivery.sender_id &&
+      principal.endpointId !== delivery.recipient_id
+    ) {
+      throw new SwitchboardError('FORBIDDEN', 'Permission denied to requeue this delivery');
+    }
+
+    const now = Date.now();
+    await this.db.execute(
+      `UPDATE message_deliveries
+       SET status = 'STORED', dead_letter_reason = NULL, dead_letter_at = NULL, delivered_at = ?
+       WHERE id = ? AND project_id = ?`,
+      [now, deliveryId, principal.projectId]
+    );
+
+    return {
+      success: true,
+      deliveryId: Number(deliveryId),
+      status: 'STORED',
+    };
+  }
+
+  /**
+   * Retire an endpoint and clean up its active resources
+   */
+  async retireEndpoint(
+    principal: AuthPrincipal,
+    targetEndpointId: string,
+    reason?: string
+  ): Promise<{ endpointId: string; status: 'retired' }> {
+    if (principal.role !== 'admin' && principal.endpointId !== targetEndpointId) {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required to retire endpoints');
+    }
+
+    const endpoint = await this.db.queryFirst<{ id: string; project_id: string }>(
+      `SELECT id, project_id FROM endpoints WHERE id = ? AND project_id = ?`,
+      [targetEndpointId, principal.projectId]
+    );
+    if (!endpoint) {
+      throw new SwitchboardError('NOT_FOUND', `Endpoint '${targetEndpointId}' not found`);
+    }
+
+    const now = Date.now();
+    const retireReason = reason ?? 'Endpoint retired';
+
+    await this.db.transaction(async (tx) => {
+      // 1. Update endpoint status
+      await tx.execute(
+        `UPDATE endpoint_status
+         SET state = 'retired', description = ?, updated_at = ?, updated_by = ?
+         WHERE endpoint_id = ? AND project_id = ?`,
+        [retireReason, now, principal.endpointId, targetEndpointId, principal.projectId]
+      );
+
+      // 2. Revoke all credentials for the endpoint
+      await tx.execute(
+        `UPDATE credentials SET revoked = 1 WHERE endpoint_id = ? AND project_id = ?`,
+        [targetEndpointId, principal.projectId]
+      );
+
+      // 3. Remove channel memberships
+      await tx.execute(
+        `DELETE FROM channel_members WHERE endpoint_id = ?`,
+        [targetEndpointId]
+      );
+
+      // 4. Dead-letter pending deliveries
+      await tx.execute(
+        `UPDATE message_deliveries
+         SET status = 'DEAD_LETTER', dead_letter_reason = ?, dead_letter_at = ?
+         WHERE recipient_id = ? AND project_id = ? AND status = 'STORED'`,
+        [retireReason, now, targetEndpointId, principal.projectId]
+      );
+    });
+
+    return {
+      endpointId: targetEndpointId,
+      status: 'retired',
+    };
+  }
+
+  /**
+   * Create a scheduled or manual backup with full integrity manifest
+   */
+  async createScheduledBackup(projectId: string): Promise<BackupRecord> {
+    const exportData = await this.exportData({
+      endpointId: 'system',
+      projectId,
+      scopes: ['admin'],
+      role: 'admin',
+    });
+
+    const backupId = `bk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    const manifestJson = JSON.stringify(exportData);
+
+    await this.db.execute(
+      `INSERT INTO backups (id, project_id, version, checksum_sha256, manifest_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [backupId, projectId, exportData.version, exportData.checksumSha256, manifestJson, now]
+    );
+
+    return {
+      id: backupId,
+      projectId,
+      version: exportData.version,
+      checksumSha256: exportData.checksumSha256,
+      manifestJson,
+      createdAt: now,
+    };
+  }
+
+  /**
+   * List recorded backups for project
+   */
+  async listBackups(principal: AuthPrincipal): Promise<BackupRecord[]> {
+    const rows = await this.db.query<{
+      id: string;
+      project_id: string;
+      version: string;
+      checksum_sha256: string;
+      created_at: number;
+    }>(
+      `SELECT id, project_id, version, checksum_sha256, created_at
+       FROM backups WHERE project_id = ? ORDER BY created_at DESC`,
+      [principal.projectId]
+    );
+
+    return rows.map((r) => ({
+      id: r.id,
+      projectId: r.project_id,
+      version: r.version,
+      checksumSha256: r.checksum_sha256,
+      createdAt: r.created_at,
+    }));
+  }
+
+  /**
+   * Restore database state from a backup
+   */
+  async restoreFromBackup(
+    principal: AuthPrincipal,
+    backupId: string
+  ): Promise<{ importedCount: number; backupId: string }> {
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required to restore from backup');
+    }
+
+    const row = await this.db.queryFirst<{ manifest_json: string }>(
+      `SELECT manifest_json FROM backups WHERE id = ? AND project_id = ?`,
+      [backupId, principal.projectId]
+    );
+
+    if (!row) {
+      throw new SwitchboardError('NOT_FOUND', `Backup '${backupId}' not found`);
+    }
+
+    const parsed: ExportData = JSON.parse(row.manifest_json);
+    const result = await this.importData(principal, parsed);
+
+    return {
+      importedCount: result.importedCount,
+      backupId,
+    };
   }
 }

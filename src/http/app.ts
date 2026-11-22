@@ -13,6 +13,8 @@ import {
 } from '../core/schema.js';
 import type { AuthPrincipal } from '../core/types.js';
 import { acceptsProtocol, PROTOCOL_HEADER, PROTOCOL_INFO } from '../operations/control.js';
+import { runHousekeeping } from '../operations/housekeeping.js';
+import { BudgetManager } from '../operations/budget.js';
 
 export interface AppDependencies {
   authService: AuthService;
@@ -27,6 +29,7 @@ export function createSwitchboardApp(deps: AppDependencies) {
   const app = new Hono();
   const auth = deps.authService;
   const svc = deps.service;
+  const db = svc.database;
   const metrics = deps.metrics ?? MetricsCollector.getInstance();
   const rateLimitMax = deps.rateLimitMaxPerMinute ?? 600; // 600 req/min default
 
@@ -319,6 +322,117 @@ export function createSwitchboardApp(deps: AppDependencies) {
       body.expiresInMs
     );
     return c.json({ endpointId: body.endpointId, status: 'issued' });
+  });
+
+  // Credential rotation
+  app.post('/api/v1/auth/rotate', async (c) => {
+    const principal = await requirePrincipal(c);
+    const body = await c.req.json();
+    if (!body.newToken) {
+      throw new SwitchboardError('INVALID_INPUT', 'newToken is required for credential rotation');
+    }
+    const targetEndpointId = body.endpointId ?? principal.endpointId;
+    if (principal.role !== 'admin' && targetEndpointId !== principal.endpointId) {
+      throw new SwitchboardError(
+        'FORBIDDEN',
+        'Permission denied to rotate credentials for another endpoint'
+      );
+    }
+    const result = await auth.rotateToken(principal.projectId, targetEndpointId, body.newToken, {
+      oldToken: body.oldToken,
+      gracePeriodMs: body.gracePeriodMs,
+      scopes: body.scopes,
+      newExpiresInMs: body.expiresInMs,
+    });
+    return c.json(result);
+  });
+
+  // Housekeeping
+  app.post('/api/v1/admin/housekeeping', async (c) => {
+    const principal = await requirePrincipal(c);
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required for housekeeping');
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const report = await runHousekeeping(db, {
+      projectId: principal.projectId,
+      retentionDays: body.retentionDays,
+      deadLetterAgeDays: body.deadLetterAgeDays,
+      auditLogRetentionDays: body.auditLogRetentionDays,
+    });
+    return c.json(report);
+  });
+
+  // Endpoint retirement
+  app.post('/api/v1/admin/endpoints/:id/retire', async (c) => {
+    const principal = await requirePrincipal(c);
+    const targetEndpointId = c.req.param('id');
+    const body = await c.req.json().catch(() => ({}));
+    const result = await svc.retireEndpoint(principal, targetEndpointId, body.reason);
+    return c.json(result);
+  });
+
+  // Dead-letter management
+  app.get('/api/v1/dead-letters', async (c) => {
+    const principal = await requirePrincipal(c);
+    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : undefined;
+    const offset = c.req.query('offset') ? Number(c.req.query('offset')) : undefined;
+    const result = await svc.getDeadLetters(principal, { limit, offset });
+    return c.json(result);
+  });
+
+  app.post('/api/v1/dead-letters/requeue', async (c) => {
+    const principal = await requirePrincipal(c);
+    const body = await c.req.json();
+    if (body.deliveryId === undefined) {
+      throw new SwitchboardError('INVALID_INPUT', 'deliveryId is required');
+    }
+    const result = await svc.requeueDeadLetter(principal, body.deliveryId);
+    return c.json(result);
+  });
+
+  // Backups
+  app.post('/api/v1/admin/backups', async (c) => {
+    const principal = await requirePrincipal(c);
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required');
+    }
+    const backup = await svc.createScheduledBackup(principal.projectId);
+    return c.json(backup, 201);
+  });
+
+  app.get('/api/v1/admin/backups', async (c) => {
+    const principal = await requirePrincipal(c);
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required');
+    }
+    const backups = await svc.listBackups(principal);
+    return c.json({ backups });
+  });
+
+  app.post('/api/v1/admin/backups/:id/restore', async (c) => {
+    const principal = await requirePrincipal(c);
+    const backupId = c.req.param('id');
+    const result = await svc.restoreFromBackup(principal, backupId);
+    return c.json(result);
+  });
+
+  // Budget
+  app.get('/api/v1/budget', async (c) => {
+    const principal = await requirePrincipal(c);
+    const report = await BudgetManager.getInstance().getReport(db, principal.projectId);
+    return c.json(report);
+  });
+
+  app.put('/api/v1/admin/budget', async (c) => {
+    const principal = await requirePrincipal(c);
+    if (principal.role !== 'admin') {
+      throw new SwitchboardError('FORBIDDEN', 'Admin privileges required');
+    }
+    const body = await c.req.json();
+    await BudgetManager.getInstance().setLimits(db, principal.projectId, body);
+    const report = await BudgetManager.getInstance().getReport(db, principal.projectId);
+    return c.json(report);
   });
 
   return app;

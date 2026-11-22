@@ -2,6 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { SwitchboardService } from '../core/service.js';
 import type { AuthPrincipal } from '../core/types.js';
+import { AuthService } from '../auth/auth-service.js';
+import { BudgetManager } from '../operations/budget.js';
 
 export function createSwitchboardMcpServer(
   service: SwitchboardService,
@@ -220,6 +222,81 @@ export function createSwitchboardMcpServer(
       content: [{ type: 'text', text: JSON.stringify(board, null, 2) }],
     };
   });
+
+  // 11. get_budget
+  server.tool('get_budget', {}, async () => {
+    const report = await BudgetManager.getInstance().getReport(
+      service.database,
+      principal.projectId
+    );
+    return {
+      content: [{ type: 'text', text: JSON.stringify(report, null, 2) }],
+    };
+  });
+
+  // 12. rotate_credential
+  server.tool(
+    'rotate_credential',
+    {
+      new_token: z.string().describe('New bearer token to issue'),
+      old_token: z.string().optional().describe('Existing token being rotated'),
+      grace_period_ms: z.number().int().optional().describe('Grace period in ms where old token remains valid'),
+    },
+    async (params) => {
+      const auth = new AuthService(service.database);
+      const result = await auth.rotateToken(principal.projectId, principal.endpointId, params.new_token, {
+        oldToken: params.old_token,
+        gracePeriodMs: params.grace_period_ms,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    }
+  );
+
+  // 13. get_dead_letters
+  server.tool(
+    'get_dead_letters',
+    {
+      limit: z.number().int().min(1).max(32).optional(),
+      offset: z.number().int().min(0).optional(),
+    },
+    async (params) => {
+      const res = await service.getDeadLetters(principal, params);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+      };
+    }
+  );
+
+  // 14. requeue_dead_letter
+  server.tool(
+    'requeue_dead_letter',
+    {
+      delivery_id: z.number().int().describe('ID of dead-letter delivery to requeue'),
+    },
+    async (params) => {
+      const res = await service.requeueDeadLetter(principal, params.delivery_id);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+      };
+    }
+  );
+
+  // 15. retire_endpoint
+  server.tool(
+    'retire_endpoint',
+    {
+      endpoint_id: z.string().describe('Endpoint ID to retire'),
+      reason: z.string().optional().describe('Reason for retirement'),
+    },
+    async (params) => {
+      const res = await service.retireEndpoint(principal, params.endpoint_id, params.reason);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+      };
+    }
+  );
 
   return server;
 }
