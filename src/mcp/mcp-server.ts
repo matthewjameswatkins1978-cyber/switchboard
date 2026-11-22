@@ -7,8 +7,17 @@ import { BudgetManager } from '../operations/budget.js';
 
 export function createSwitchboardMcpServer(
   service: SwitchboardService,
-  principal: AuthPrincipal
+  principal: AuthPrincipal,
+  options: { audit?: (tool: string) => string; allowCredentialRotation?: boolean } = {},
 ): McpServer {
+  const { audit } = options;
+  const auditedResult = (tool: string, result: unknown) => {
+    const content = [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }];
+    if (!audit) return { content };
+    const receipt = audit(tool);
+    content.push({ type: 'text', text: 'Switchboard receipt ' + receipt });
+    return { content, _meta: { 'switchboard/receipt': receipt } };
+  };
   const server = new McpServer({
     name: 'switchboard',
     version: '0.1.0',
@@ -50,9 +59,7 @@ export function createSwitchboardMcpServer(
         evidenceRefs: params.evidence_refs,
       });
 
-      return {
-        content: [{ type: 'text', text: JSON.stringify(receipt, null, 2) }],
-      };
+      return auditedResult('send_message', receipt);
     }
   );
 
@@ -113,11 +120,10 @@ export function createSwitchboardMcpServer(
       limit: z.number().int().min(1).max(32).optional(),
       offset: z.number().int().min(0).optional(),
     },
+    { readOnlyHint: true },
     async (params) => {
       const inbox = await service.getInbox(principal, params);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(inbox, null, 2) }],
-      };
+      return auditedResult('get_inbox', inbox);
     }
   );
 
@@ -137,9 +143,7 @@ export function createSwitchboardMcpServer(
           note: params.note,
         },
       ]);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(receipts, null, 2) }],
-      };
+      return auditedResult('acknowledge', receipts);
     }
   );
 
@@ -174,11 +178,9 @@ export function createSwitchboardMcpServer(
   );
 
   // 7. list_endpoints
-  server.tool('list_endpoints', {}, async () => {
+  server.tool('list_endpoints', {}, { readOnlyHint: true }, async () => {
     const endpoints = await service.listEndpoints(principal);
-    return {
-      content: [{ type: 'text', text: JSON.stringify(endpoints, null, 2) }],
-    };
+    return auditedResult('list_endpoints', endpoints);
   });
 
   // 8. get_status
@@ -187,11 +189,10 @@ export function createSwitchboardMcpServer(
     {
       endpoint_id: z.string().describe('Endpoint ID to query'),
     },
+    { readOnlyHint: true },
     async (params) => {
       const st = await service.getStatus(principal, params.endpoint_id);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(st, null, 2) }],
-      };
+      return auditedResult('get_status', st);
     }
   );
 
@@ -234,8 +235,8 @@ export function createSwitchboardMcpServer(
     };
   });
 
-  // 12. rotate_credential
-  server.tool(
+  // OAuth grants must never mint independent, long-lived bearer credentials.
+  if (options.allowCredentialRotation !== false) server.tool(
     'rotate_credential',
     {
       new_token: z.string().describe('New bearer token to issue'),

@@ -4,6 +4,19 @@ import type { AuthService } from '../auth/auth-service.js';
 import type { SwitchboardService } from '../core/service.js';
 import { createSwitchboardMcpServer } from './mcp-server.js';
 import { SwitchboardError } from '../core/errors.js';
+import type { AuthPrincipal } from '../core/types.js';
+
+export async function serveWebMcp(
+  request: Request,
+  service: SwitchboardService,
+  principal: AuthPrincipal,
+  options?: Parameters<typeof createSwitchboardMcpServer>[2],
+) {
+  const server = createSwitchboardMcpServer(service, principal, options);
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  await server.connect(transport);
+  return transport.handleRequest(request);
+}
 
 export function mountWebMcpRoutes(
   app: Hono,
@@ -19,14 +32,6 @@ export function mountWebMcpRoutes(
       throw new SwitchboardError('UNAUTHORIZED', 'Missing Authorization header for MCP');
     }
     const principal = await deps.authService.authenticate(authHeader);
-    const mcpServer = createSwitchboardMcpServer(deps.service, principal);
-
-    // Stateless mode per official MCP spec
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-
-    await mcpServer.connect(transport);
-    return await transport.handleRequest(c.req.raw);
+    return serveWebMcp(c.req.raw, deps.service, principal);
   });
 }
