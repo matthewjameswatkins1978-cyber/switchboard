@@ -1,5 +1,33 @@
 # Switchboard
 
+## Optional Oracle telemetry (provisional)
+
+Disabled by default; there is no Oracle dependency. For a local Node server only,
+set `SWITCHBOARD_TELEMETRY=1` to enable a private JSONL file per server run in
+`.switchboard-telemetry/` (override with `SWITCHBOARD_TELEMETRY_DIR`). Leave the
+setting unset until qualification. The Worker does not use the local sink.
+
+`oracle.toml` declares the permitted signals. Each record contains `v`, `seq`
+(per-run monotonic observation sequence; gaps indicate dropped observations),
+`kind`, `name`, `value`, `unit`, and UTC `observed_at`. Counters are increments,
+gauges are snapshots, events have value 1, and durations are milliseconds.
+Only request timing, aggregate counts and lifecycle events are observed; no
+request paths, identifiers, headers, credentials, bodies or error text.
+
+The asynchronous sink drops observations on overload, disk failure or the 1 MiB
+per-run limit, with at most 256 queued records plus one in-flight batch. It never
+waits for disk during request handling. On orderly server close it attempts to
+flush; abrupt termination may lose the final batch. Old files remain available
+for operator-controlled archival; this is not a durable messaging log. The
+portable `ObservationTransport` boundary is replaceable when the official Oracle
+plug is ready. The wire contract is provisional pending Oracle v0.1.
+
+Standalone adapter verification (Node 24+):
+
+```sh
+node --test tests/telemetry/adapter.node-test.mjs
+```
+
 Lean, dependable communication infrastructure for AI agents and ordinary programs.
 
 Switchboard provides durable addressed messaging, bounded incremental synchronization, per-recipient acknowledgements, scoped presence, and coordination through the Model Context Protocol (MCP) and a lightweight REST API. It is provider-neutral, self-hostable, and engineered for small teams and modest budgets.

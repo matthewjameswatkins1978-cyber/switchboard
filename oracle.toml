@@ -1,0 +1,40 @@
+# Provisional integration manifest, pending Oracle v0.1. Not an Oracle dependency.
+manifest_version = 1
+wire_version = 1
+source = "switchboard"
+enabled_by_default = false
+transport = "local-ndjson"
+session_scope = "one file per server run"
+max_file_bytes = 1048576
+max_pending_records = 256
+sensitive_data = false
+
+[[signals]]
+name = "request.duration"
+kind = "measurement"
+unit = "ms"
+
+[[signals]]
+name = "request.completed"
+kind = "counter"
+unit = "count"
+
+[[signals]]
+name = "request.failed"
+kind = "counter"
+unit = "count"
+
+[[signals]]
+name = "request.inflight"
+kind = "gauge"
+unit = "count"
+
+[[signals]]
+name = "session.started"
+kind = "event"
+unit = "count"
+
+[[signals]]
+name = "session.stopped"
+kind = "event"
+unit = "count"
