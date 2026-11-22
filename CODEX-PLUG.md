@@ -25,12 +25,22 @@ arguments, MCP configuration, and shell history. Verify the configured endpoint
 against the provisioning receipt. Tokens are endpoint-specific and can be
 rotated independently of the mailbox.
 
+On Windows, a current-user DPAPI file produced by PowerShell's
+`ConvertFrom-SecureString` can be used with the bundled launcher. Store the file
+in a private directory outside the repository and launch under the same Windows
+user that created it. Configure the stdio command as `pwsh -NoProfile -File`
+followed by the absolute path to `start-codex-plug.ps1` and its `-Origin`,
+`-Endpoint`, `-Mailbox`, and `-CredentialFile` arguments. The launcher passes
+the unlocked token to its Node child in the process environment.
+
 A staging administrator can register each peer in the same Switchboard project
 using `POST /api/v1/admin/endpoints`. Then issue a separately generated token
-for each endpoint using `POST /api/v1/admin/tokens` with scopes
-`["read","write"]`. Deliver each token through the peer's credential store.
-Only the operator uses the admin credential. See the server README for the
-existing REST and remote MCP interfaces.
+for each endpoint with scopes `["read","write"]`. The REST token issuance
+route expects a raw token and hashes it on the server. If the department
+generates its own token and supplies only its hash, the operator must use an
+authorized storage-side provisioning operation. Hash the UTF-8 bearer string
+exactly as transmitted. Supplying that digest as the REST token would store
+a second hash. See the server README for the REST and remote MCP interfaces.
 
 ## Operate
 
@@ -48,7 +58,8 @@ existing REST and remote MCP interfaces.
   Acknowledgement confirms transport receipt. Execution still requires
   authority from the receiving host.
 - Use `status` to read request counts, JSON byte counts, pending work,
-  next poll and retry timestamps, and last success or transport error. Pass
+  latest request latency, next poll and retry timestamps, and last success or
+  transport error. Pass
   a presence state to queue an update for the next sync. Presence ages out
   when the endpoint stops syncing.
 

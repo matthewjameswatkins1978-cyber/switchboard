@@ -34,10 +34,12 @@ export function createCodexPlug(config: {
   const initial = {
     presence: StatusUpdateInputSchema.parse({ state: 'available' }), dirty: false,
     requests: 0, requestBytes: 0, responseBytes: 0, failures: 0, retryAt: 0, nextPollAt: 0, more: false,
-    cursor: undefined as string | undefined, lastSuccessAt: 0, lastError: '',
+    cursor: undefined as string | undefined, lastSuccessAt: 0, lastError: '', lastLatencyMs: 0,
   };
   const identity = JSON.stringify([origin.origin, endpoint]);
-  db.prepare('INSERT OR IGNORE INTO mailbox VALUES (1, ?, ?)').run(identity, JSON.stringify(initial));
+  if (!db.prepare('SELECT id FROM mailbox WHERE id = 1').get()) {
+    db.prepare('INSERT OR IGNORE INTO mailbox VALUES (1, ?, ?)').run(identity, JSON.stringify(initial));
+  }
   if (db.prepare('SELECT identity FROM mailbox').get()?.identity !== identity) {
     db.close();
     throw new Error('Mailbox belongs to another Switchboard origin or endpoint.');
@@ -47,8 +49,18 @@ export function createCodexPlug(config: {
   const network = config.fetch ?? fetch;
   const read = (): typeof initial => JSON.parse(db.prepare('SELECT state FROM mailbox').get()?.state as string);
   const save = (state: typeof initial) => db.prepare('UPDATE mailbox SET state = ?').run(JSON.stringify(state));
+  const beginWrite = () => {
+    try {
+      db.exec('BEGIN IMMEDIATE');
+    } catch (error) {
+      if ((error as { errcode?: number }).errcode === 5) {
+        throw new Error('Mailbox busy in another process. Retry after the current operation.');
+      }
+      throw error;
+    }
+  };
   const transact = <T>(operation: () => T): T => {
-    db.exec('BEGIN IMMEDIATE');
+    beginWrite();
     try {
       const value = operation();
       db.exec('COMMIT');
@@ -107,10 +119,12 @@ export function createCodexPlug(config: {
     inputSchema: AckInputSchema,
   }, (ack) => {
     writable();
-    const updated = db.prepare('UPDATE inbox SET ack = coalesce(ack, ?) WHERE sender = ? AND id = ?')
-      .run(JSON.stringify(ack), ack.senderId, ack.messageId);
-    if (!updated.changes) throw new Error('Message is absent from the local inbox.');
-    return result({ senderId: ack.senderId, messageId: ack.messageId, ...pending() });
+    return transact(() => {
+      const updated = db.prepare('UPDATE inbox SET ack = coalesce(ack, ?) WHERE sender = ? AND id = ?')
+        .run(JSON.stringify(ack), ack.senderId, ack.messageId);
+      if (!updated.changes) throw new Error('Message is absent from the local inbox.');
+      return result({ senderId: ack.senderId, messageId: ack.messageId, ...pending() });
+    });
   });
 
   server.registerTool('status', {
@@ -129,7 +143,7 @@ export function createCodexPlug(config: {
     inputSchema: {},
   }, async () => {
     writable();
-    db.exec('BEGIN IMMEDIATE');
+    beginWrite();
     syncing = true;
     try {
       const state = read();
@@ -157,6 +171,7 @@ export function createCodexPlug(config: {
       state.requests++;
       state.requestBytes += Buffer.byteLength(body);
       let response: SyncResponse;
+      const started = performance.now();
       try {
         const reply = await network(new URL('/api/v1/sync', origin), {
           method: 'POST',
@@ -186,9 +201,10 @@ export function createCodexPlug(config: {
         state.lastError = error instanceof Error ? error.message : 'Sync failed.';
         state.failures++;
         state.retryAt = Math.max(state.retryAt, now() + calculateExponentialBackoffWithJitter(state.failures));
-        save(state);
+        const latencyMs = Math.round(performance.now() - started);
+        save({ ...state, lastLatencyMs: latencyMs });
         db.exec('COMMIT');
-        return result({ outcome: 'failed', error: state.lastError, retryAt: state.retryAt, pending: backlog });
+        return result({ outcome: 'failed', error: state.lastError, retryAt: state.retryAt, latencyMs, pending: backlog });
       }
       for (const message of batch.outgoingMessages ?? []) {
         db.prepare('UPDATE outbox SET attempted = ? WHERE id = ?').run(state.requests, message.id);
@@ -206,15 +222,16 @@ export function createCodexPlug(config: {
       for (const receipt of response.acknowledgedReceipts) {
         db.prepare('UPDATE inbox SET acked = 1 WHERE sender = ? AND id = ?').run(receipt.senderId, receipt.messageId);
       }
+      const latencyMs = Math.round(performance.now() - started);
       save({
-        ...state, cursor: response.cursor, nextPollAt: now() + response.recommendedNextSyncMs,
+        ...state, lastLatencyMs: latencyMs, cursor: response.cursor, nextPollAt: now() + response.recommendedNextSyncMs,
         more: response.hasMore, lastSuccessAt: now(), failures: 0, lastError: '',
         retryAt: response.errors.length ? now() + response.recommendedNextSyncMs : 0,
         dirty: false,
       });
       db.exec('COMMIT');
       return result({
-        outcome: 'synced', received: response.inboundMessages.length,
+        outcome: 'synced', received: response.inboundMessages.length, latencyMs,
         stored: response.storedReceipts, acknowledged: response.acknowledgedReceipts,
         errors: response.errors, hasMore: response.hasMore, recommendedNextSyncMs: response.recommendedNextSyncMs,
         pending: pending(),
