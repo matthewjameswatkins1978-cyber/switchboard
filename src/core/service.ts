@@ -10,6 +10,7 @@ import type {
   MessageEnvelope,
   StatusUpdateInput,
   EndpointStatusRecord,
+  EndpointState,
   BoardSummary,
   ExportData,
   DeliveryStatus,
@@ -26,7 +27,7 @@ import {
   StatusUpdateInputSchema,
 } from './schema.js';
 import { sha256 } from '../auth/auth-service.js';
-import { calculateRecommendedNextSync, isPresenceStale } from './timings.js';
+import { calculateRecommendedNextSync, isPresenceStale, DEFAULT_TIMINGS } from './timings.js';
 import { MetricsCollector } from './metrics.js';
 import { BudgetManager } from '../operations/budget.js';
 import type { BackupStorage } from '../operations/backup-storage.js';
@@ -450,6 +451,7 @@ export class SwitchboardService {
 
         // 3. Process status update or piggybacked heartbeat
         const now = Date.now();
+        let effectiveStatus: { state: EndpointState; updated_at: number } | undefined;
         if (validated.statusUpdate) {
           StatusUpdateInputSchema.parse(validated.statusUpdate);
           const currentStatus = await tx.queryFirst<{ revision: number }>(
@@ -489,14 +491,8 @@ export class SwitchboardService {
                 principal.endpointId,
               ]
             );
+            effectiveStatus = { state: validated.statusUpdate.state, updated_at: now };
           }
-        } else {
-          // Automatic heartbeat update on sync
-          await tx.execute(
-            `UPDATE endpoint_status SET last_heartbeat_at = ?
-             WHERE endpoint_id = ? AND project_id = ?`,
-            [now, principal.endpointId, principal.projectId]
-          );
         }
 
         // 4. Retrieve inbound messages
@@ -592,13 +588,14 @@ export class SwitchboardService {
         const hasUrgentOutbound = validated.outgoingMessages?.some((m) => m.priority === 'urgent');
 
         // Check current endpoint state
-        const statusRecord = await tx.queryFirst<{ state: any }>(
-          `SELECT state FROM endpoint_status WHERE endpoint_id = ? AND project_id = ?`,
+        const statusRecord = effectiveStatus ?? await tx.queryFirst<{ state: EndpointState; updated_at: number }>(
+          `SELECT state, updated_at FROM endpoint_status WHERE endpoint_id = ? AND project_id = ?`,
           [principal.endpointId, principal.projectId]
         );
 
         const baseRecommendedNextSyncMs = calculateRecommendedNextSync({
           endpointState: statusRecord?.state ?? 'available',
+          awaitingResponseStartMs: statusRecord?.state === 'waiting' ? statusRecord.updated_at : undefined,
           hasUrgentActivity: hasUrgentInbound || hasUrgentOutbound,
           hasUnreadMessages: inboundMessages.length > 0,
           now,
@@ -607,6 +604,18 @@ export class SwitchboardService {
         const recommendedNextSyncMs = Math.round(
           baseRecommendedNextSyncMs * budgetReport.cadenceMultiplier
         );
+
+        // Coalesce passive heartbeats, without consuming the next poll's freshness margin.
+        // Explicit status changes still persist immediately, including during fast polling.
+        if (!effectiveStatus) {
+          const minAge = Math.min(DEFAULT_TIMINGS.heartbeatIntervalMs,
+            Math.max(0, DEFAULT_TIMINGS.stalePresenceThresholdMs - recommendedNextSyncMs - 5000));
+          await tx.execute(
+            `UPDATE endpoint_status SET last_heartbeat_at = ?
+             WHERE endpoint_id = ? AND project_id = ? AND last_heartbeat_at <= ?`,
+            [now, principal.endpointId, principal.projectId, now - minAge]
+          );
+        }
 
         const nextCursor = this.encodeCursor(maxSeqSeen);
 

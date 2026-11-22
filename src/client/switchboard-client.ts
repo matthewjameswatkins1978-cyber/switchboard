@@ -830,14 +830,12 @@ export class SwitchboardClient {
         const res = await this.sync();
         nextDelay = res.recommendedNextSyncMs;
 
-        // Bounded awaiting response check
-        if (this.awaitingResponseStartMs) {
-          if (Date.now() - this.awaitingResponseStartMs > 120000) {
-            this.awaitingResponseStartMs = undefined;
-            nextDelay = DEFAULT_TIMINGS.activeInboxCadenceMs;
-          } else {
-            nextDelay = DEFAULT_TIMINGS.awaitingResponseCadenceMs;
-          }
+        // Respect server budget and urgent hints. Older servers may indefinitely
+        // recommend the fast waiting cadence, so retain a local expiry floor.
+        if (this.awaitingResponseStartMs !== undefined &&
+            Date.now() - this.awaitingResponseStartMs >= 120000 &&
+            nextDelay >= DEFAULT_TIMINGS.awaitingResponseCadenceMs) {
+          nextDelay = Math.max(nextDelay, DEFAULT_TIMINGS.activeInboxCadenceMs);
         }
 
         if (onMessage && res.inboundMessages.length > 0) {

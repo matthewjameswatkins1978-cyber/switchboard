@@ -496,6 +496,20 @@ describe('SWB-006 Final Acceptance Repairs Qualification', () => {
     expect(report.status).toBe('HEALTHY');
   });
 
+  it('atomically rolls over and adds usage while preserving budget limits and storage', async () => {
+    const budget = BudgetManager.getInstance();
+    await budget.setLimits(db, projectId, { maxRequests: 1234 });
+    await budget.recordUsage(db, projectId, { requests: 50, rowsRead: 20, rowsWritten: 10, storageBytes: 500 });
+    await db.execute('UPDATE usage_accounting SET cycle_start_at = ? WHERE project_id = ?', [Date.now() - CYCLE_DURATION_MS - 1, projectId]);
+    // No intervening report/read: the UPSERT itself must perform rollover.
+    await Promise.all([
+      budget.recordUsage(db, projectId, { requests: 2, rowsRead: 4, rowsWritten: 6 }),
+      budget.recordUsage(db, projectId, { requests: 3, rowsRead: 5, rowsWritten: 7 }),
+    ]);
+    const report = await budget.getReport(db, projectId);
+    expect(report).toMatchObject({ requestCount: 5, rowsRead: 9, rowsWritten: 13, storageBytes: 500, limits: { maxRequests: 1234 } });
+  });
+
   // Finding 7: Ensure exhausted budgets cannot prevent recipients from retrieving or acknowledging messages
   it('guarantees that budget exhaustion never blocks inbound message retrieval or delivery acknowledgements', async () => {
     const budget = BudgetManager.getInstance();

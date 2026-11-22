@@ -45,8 +45,9 @@ export function calculateRecommendedNextSync(params: {
     return config.urgentSyncMs;
   }
 
-  if (params.isAwaitingResponse) {
-    const elapsedAwaiting = params.awaitingResponseStartMs ? now - params.awaitingResponseStartMs : 0;
+  if (params.isAwaitingResponse || params.endpointState === 'waiting') {
+    const elapsedAwaiting = params.awaitingResponseStartMs !== undefined
+      ? now - params.awaitingResponseStartMs : Infinity;
     // SPEC: 10 seconds, limited to 2 minutes then normal
     if (elapsedAwaiting < 120000) {
       return config.awaitingResponseCadenceMs;
@@ -58,7 +59,7 @@ export function calculateRecommendedNextSync(params: {
   }
 
   if (params.endpointState === 'waiting') {
-    return config.awaitingResponseCadenceMs;
+    return config.activeInboxCadenceMs;
   }
 
   if (params.endpointState === 'available') {

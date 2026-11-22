@@ -170,6 +170,8 @@ Switchboard is fully compatible with Cloudflare Workers and D1:
 
 ## Performance & Economy
 
+Keep ordinary polling cheap: passive heartbeats coalesce within the configured 60-second interval, with an earlier refresh if the next advertised cadence would threaten the freshness margin. Explicit presence updates remain immediate. Waiting presence uses 10-second polling for at most two minutes, then returns to 30 seconds before budget multipliers. Usage increments and rollover use one atomic database statement rather than a read followed by a write. These changes preserve durable messages and acknowledgements; measured provider totals still depend on workload and indexes.
+
 Under rigorous load qualification (`tests/load/capacity.test.ts`):
 - **10 Active Endpoints:** P95 latency **~3.5 ms** (well below the 2000 ms SLA).
 - **50 Concurrent Endpoints:** P95 latency **~17.5 ms** with zero message loss and zero duplicate deliveries.

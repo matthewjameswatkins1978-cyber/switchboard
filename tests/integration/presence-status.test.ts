@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { initializeSchema } from '../../src/db/schema.js';
 import { AuthService } from '../../src/auth/auth-service.js';
@@ -66,17 +66,54 @@ describe('Presence, Scoped Status, and Optimistic Concurrency', () => {
     ).rejects.toThrowError(/Revision conflict/);
   });
 
-  it('piggybacks heartbeat automatically on sync requests', async () => {
+  it('coalesces fast polls, refreshes due heartbeats, and preserves explicit presence changes', async () => {
     const principalA = await authService.authenticate(`Bearer ${tokenA}`);
+    await db.execute('UPDATE endpoint_status SET last_heartbeat_at = ? WHERE endpoint_id = ?', [Date.now() - 10_000, 'worker-1']);
     const beforeSync = await service.getStatus(principalA, 'worker-1');
 
-    // Artificial delay to observe monotonic heartbeat advance
-    await new Promise((r) => setTimeout(r, 20));
-
     await clientA.sync();
+    expect((await service.getStatus(principalA, 'worker-1')).lastHeartbeatAt).toBe(beforeSync.lastHeartbeatAt);
+    const old = Date.now() - 61_000;
+    await db.execute('UPDATE endpoint_status SET last_heartbeat_at = ? WHERE endpoint_id = ?', [old, 'worker-1']);
+    await clientA.sync();
+    const refreshed = await service.getStatus(principalA, 'worker-1');
+    expect(refreshed.lastHeartbeatAt).toBeGreaterThan(old);
+    expect(refreshed.revision).toBe(beforeSync.revision);
+    await service.sync(principalA, { statusUpdate: { state: 'busy' } });
+    const busy = await service.getStatus(principalA, 'worker-1');
+    expect(busy.state).toBe('busy');
+    expect(busy.revision).toBe(beforeSync.revision + 1);
+  });
 
-    const afterSync = await service.getStatus(principalA, 'worker-1');
-    expect(afterSync.lastHeartbeatAt).toBeGreaterThan(beforeSync.lastHeartbeatAt);
+  it('ends fast waiting polling after two minutes without changing the status', async () => {
+    const principalA = await authService.authenticate(`Bearer ${tokenA}`);
+    expect((await service.sync(principalA, { statusUpdate: { state: 'waiting' } })).recommendedNextSyncMs).toBe(10_000);
+    expect((await service.sync(principalA, {})).recommendedNextSyncMs).toBe(10_000);
+    await db.execute('UPDATE endpoint_status SET updated_at = ? WHERE endpoint_id = ?', [Date.now() - 121_000, 'worker-1']);
+    expect((await service.sync(principalA, {})).recommendedNextSyncMs).toBe(30_000);
+    expect((await service.getStatus(principalA, 'worker-1')).state).toBe('waiting');
+  });
+
+  it('respects server throttling instead of overriding it while waiting', async () => {
+    vi.useFakeTimers();
+    let stop: (() => void) | undefined;
+    try {
+      clientA.setStatus({ state: 'waiting' });
+      const sync = vi.spyOn(clientA, 'sync').mockResolvedValue({
+        storedReceipts: [], acknowledgedReceipts: [], inboundMessages: [], errors: [],
+        cursor: '', hasMore: false, serverTime: Date.now(), recommendedNextSyncMs: 90_000,
+      });
+      stop = clientA.startAutonomousSync();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(sync).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sync).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(sync).toHaveBeenCalledTimes(2);
+    } finally {
+      stop?.();
+      vi.useRealTimers();
+    }
   });
 
   it('marks endpoint as stale after missed heartbeats', async () => {

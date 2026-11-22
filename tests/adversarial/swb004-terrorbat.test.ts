@@ -107,6 +107,43 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
     } catch {}
   });
 
+  it('reduces frequent heartbeat writes and bounds awaiting cadence on local D1', async () => {
+    const runtime = new Miniflare(convertV4MiniflareOptions({
+      modules: true,
+      script: 'export default { fetch() { return new Response("fixture"); } };',
+      compatibilityDate: '2024-11-01',
+      d1Databases: ['DB'],
+    }));
+    try {
+      const binding = await runtime.getD1Database('DB');
+      const migration = await fs.readFile('src/db/migrations/0001_initial_schema.sql', 'utf8');
+      await binding.batch(migration.split(';').map(sql => sql.trim()).filter(Boolean).map(sql => binding.prepare(sql)));
+      const database = new D1Adapter(binding);
+      const auth = new AuthService(database);
+      await auth.createProject(projectId, 'Lean sync fixture');
+      await auth.registerEndpoint(projectId, alicePrincipal.endpointId, 'Alice', 'agent');
+      const svc = new SwitchboardService(database);
+      const recent = Date.now() - 10_000;
+      await database.execute('UPDATE endpoint_status SET last_heartbeat_at = ? WHERE endpoint_id = ?', [recent, alicePrincipal.endpointId]);
+      expect((await svc.sync(alicePrincipal, { statusUpdate: { state: 'waiting' } })).recommendedNextSyncMs).toBe(10_000);
+      await database.execute('UPDATE endpoint_status SET last_heartbeat_at = ? WHERE endpoint_id = ?', [recent, alicePrincipal.endpointId]);
+      expect((await svc.sync(alicePrincipal, {})).recommendedNextSyncMs).toBe(10_000);
+      expect((await svc.getStatus(alicePrincipal, alicePrincipal.endpointId)).lastHeartbeatAt).toBe(recent);
+      const old = Date.now() - 121_000;
+      await database.execute('UPDATE endpoint_status SET updated_at = ?, last_heartbeat_at = ? WHERE endpoint_id = ?', [old, old, alicePrincipal.endpointId]);
+      expect((await svc.sync(alicePrincipal, {})).recommendedNextSyncMs).toBe(30_000);
+      expect((await svc.getStatus(alicePrincipal, alicePrincipal.endpointId)).lastHeartbeatAt).toBeGreaterThan(old);
+      const budget = BudgetManager.getInstance();
+      expect((await budget.getReport(database, projectId)).requestCount).toBe(3);
+      await database.execute('UPDATE usage_accounting SET cycle_start_at = ? WHERE project_id = ?', [Date.now() - 31 * 86400000, projectId]);
+      await budget.recordUsage(database, projectId, { requests: 2, rowsWritten: 3 });
+      await budget.recordUsage(database, projectId, { requests: 1, rowsWritten: 4 });
+      expect(await budget.getReport(database, projectId)).toMatchObject({ requestCount: 3, rowsWritten: 7 });
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
   it('processes more than 500 stale deliveries over successive local D1 runs', async () => {
     const runtime = new Miniflare(convertV4MiniflareOptions({
       modules: true,

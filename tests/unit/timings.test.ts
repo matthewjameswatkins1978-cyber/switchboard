@@ -44,6 +44,13 @@ describe('Adaptive Communication Timings', () => {
     expect(nextSync).toBe(30000);
   });
 
+  it('bounds the waiting cadence at two minutes even if presence remains waiting', () => {
+    const now = 1_000_000;
+    expect(calculateRecommendedNextSync({ endpointState: 'waiting', awaitingResponseStartMs: now - 119_999, now })).toBe(10_000);
+    expect(calculateRecommendedNextSync({ endpointState: 'waiting', awaitingResponseStartMs: now - 120_000, now })).toBe(30_000);
+    expect(calculateRecommendedNextSync({ endpointState: 'waiting', now })).toBe(30_000);
+  });
+
   it('recommends 180s idle cadence for stale or offline endpoints', () => {
     const nextSync = calculateRecommendedNextSync({
       endpointState: 'offline',

@@ -88,8 +88,8 @@ export class BudgetManager {
       await db.execute(
         `UPDATE usage_accounting
          SET cycle_start_at = ?, request_count = 0, rows_read = 0, rows_written = 0, updated_at = ?
-         WHERE project_id = ?`,
-        [now, now, projectId]
+         WHERE project_id = ? AND cycle_start_at = ?`,
+        [now, now, projectId, row?.cycle_start_at]
       );
     }
 
@@ -143,32 +143,20 @@ export class BudgetManager {
     const written = delta.rowsWritten ?? 0;
     const storage = delta.storageBytes ?? 0;
 
-    // Check if existing accounting cycle has expired
-    const existing = await db.queryFirst<{ cycle_start_at: number }>(
-      `SELECT cycle_start_at FROM usage_accounting WHERE project_id = ?`,
-      [projectId]
-    );
-
-    if (existing && now - existing.cycle_start_at >= CYCLE_DURATION_MS) {
-      await db.execute(
-        `UPDATE usage_accounting
-         SET cycle_start_at = ?, request_count = 0, rows_read = 0, rows_written = 0, updated_at = ?
-         WHERE project_id = ?`,
-        [now, now, projectId]
-      );
-    }
-
+    // One atomic statement: no read-before-write or separate rollover mutation.
     await db.execute(
       `INSERT INTO usage_accounting
        (project_id, cycle_start_at, request_count, rows_read, rows_written, storage_bytes, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(project_id) DO UPDATE SET
-         request_count = usage_accounting.request_count + excluded.request_count,
-         rows_read = usage_accounting.rows_read + excluded.rows_read,
-         rows_written = usage_accounting.rows_written + excluded.rows_written,
+         cycle_start_at = CASE WHEN usage_accounting.cycle_start_at <= ? THEN excluded.cycle_start_at ELSE usage_accounting.cycle_start_at END,
+         request_count = CASE WHEN usage_accounting.cycle_start_at <= ? THEN excluded.request_count ELSE usage_accounting.request_count + excluded.request_count END,
+         rows_read = CASE WHEN usage_accounting.cycle_start_at <= ? THEN excluded.rows_read ELSE usage_accounting.rows_read + excluded.rows_read END,
+         rows_written = CASE WHEN usage_accounting.cycle_start_at <= ? THEN excluded.rows_written ELSE usage_accounting.rows_written + excluded.rows_written END,
          storage_bytes = CASE WHEN excluded.storage_bytes > 0 THEN excluded.storage_bytes ELSE usage_accounting.storage_bytes END,
          updated_at = excluded.updated_at`,
-      [projectId, now, req, read, written, storage, now]
+      [projectId, now, req, read, written, storage, now,
+        ...Array<number>(4).fill(now - CYCLE_DURATION_MS)]
     );
   }
 
