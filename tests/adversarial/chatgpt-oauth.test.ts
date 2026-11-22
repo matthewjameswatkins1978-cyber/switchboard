@@ -97,10 +97,14 @@ it('qualifies OAuth discovery, approval, isolation, messaging and revocation in 
   }
   const consent = await authorize();
   expect(consent.status).toBe(200);
+  expect(consent.headers.get('Referrer-Policy')).toBe('strict-origin');
   const cookie = consent.headers.get('set-cookie')!.split(';')[0];
   const handle = decodeURIComponent((await consent.text()).match(/name="handle" value="([^"]+)"/)![1]);
-  const approve = (secret: string, binding: string) => request(path(issuer.authorization_endpoint),
-    form({ handle, owner: secret, agent_id: 'other-agent' }, { Cookie: binding, Origin: origin }));
+  const approve = (secret: string, binding: string, requestOrigin = origin) =>
+    request(path(issuer.authorization_endpoint),
+      form({ handle, owner: secret, agent_id: 'other-agent' }, { Cookie: binding, Origin: requestOrigin }));
+  expect((await approve(owner, cookie, 'null')).status).toBe(403);
+  expect((await approve(owner, cookie, 'https://other.example')).status).toBe(403);
   expect((await approve('wrong', cookie)).status).toBe(403);
   expect((await approve(owner, '')).status).toBe(400);
   const approval = await approve(owner, cookie);

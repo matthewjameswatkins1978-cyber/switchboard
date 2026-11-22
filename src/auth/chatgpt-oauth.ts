@@ -118,6 +118,8 @@ export async function routeChatGptOAuth(
             }
             const consent = await oauth.beginConsent(parsed);
             for (const [name, value] of Object.entries(headers)) consent.headers.set(name, value);
+            // Chromium sends Origin: null for a POST from a no-referrer document.
+            consent.headers.set('Referrer-Policy', 'strict-origin');
             consent.headers.set('Content-Type', 'text/html; charset=utf-8');
             const redirectHost = new URL(parsed.redirectUri).hostname;
             return new Response(
