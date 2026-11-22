@@ -121,10 +121,13 @@ export async function routeChatGptOAuth(
             // Chromium sends Origin: null for a POST from a no-referrer document.
             consent.headers.set('Referrer-Policy', 'strict-origin');
             consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-            const redirectHost = new URL(parsed.redirectUri).hostname;
+            const redirect = new URL(parsed.redirectUri);
+            // Chromium applies form-action to the authorization redirect as well as the POST.
+            consent.headers.set('Content-Security-Policy',
+              "default-src 'none'; form-action 'self' " + redirect.origin + "; frame-ancestors 'none'");
             return new Response(
               '<!doctype html><html lang="en"><meta charset="utf-8"><title>Switchboard approval</title>' +
-              '<h1>Approve Switchboard access</h1><p>Grant ' + redirectHost +
+              '<h1>Approve Switchboard access</h1><p>Grant ' + redirect.hostname +
               ' read and write access as lucy-chat.</p><form method="post" action="' + routes.authorize + '">' +
               '<input type="hidden" name="handle" value="' + encodeURIComponent(consent.handle) + '">' +
               '<label>Owner passphrase <input name="owner" type="password" required autocomplete="off"></label>' +
