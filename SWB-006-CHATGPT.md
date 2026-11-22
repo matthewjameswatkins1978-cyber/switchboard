@@ -33,8 +33,7 @@ and [plugin connection](https://developers.openai.com/plugins/deploy/connect-cha
 
 ## Deploy and roll back
 
-Use the existing staging Worker and its current D1 binding. The `chatgpt-fixture`
-agent must already exist in the designated staging project. The OAuth route is
+Use the existing staging Worker and its current D1 binding. The staging project must already contain an active agent with the fixed server endpoint ID declared in [`src/auth/chatgpt-oauth.ts`](src/auth/chatgpt-oauth.ts). Changing the project setting does not change that ID. The OAuth route is
 disabled unless all four configuration values and the dedicated KV binding are
 present, along with the rate limiting binding. Set these only on staging.
 
@@ -108,9 +107,19 @@ presented refresh credential. The window does not extend either lifetime.
 The provider validates the client, resource, scope and approval on the
 initial exchange. Prior credentials outside the retry window are rejected.
 
-Use the private staging config with a `new_sqlite_classes` migration for
-`ChatGptOAuthState` and `CHATGPT_OAUTH_DISABLED=1` for the initial
-`wrangler deploy`. That version fences the old KV writer while keeping
+Add the following to the private Wrangler config. Use a new migration tag for a first-time migration. Preserve the existing tag and binding if the class is already deployed.
+
+```toml
+[[durable_objects.bindings]]
+name = "CHATGPT_OAUTH_STATE"
+class_name = "ChatGptOAuthState"
+
+[[migrations]]
+tag = "oauth-state-v1"
+new_sqlite_classes = ["ChatGptOAuthState"]
+```
+
+For an initial migration from KV, set `CHATGPT_OAUTH_DISABLED=1` for the initial `wrangler deploy`. That version fences the old KV writer while keeping
 static bearer routes available. After the KV propagation window, upload
 and promote the same commit at 100% with `CHATGPT_OAUTH_DISABLED=0`.
 Roll back to the paused version if needed. Returning to a pre-migration
