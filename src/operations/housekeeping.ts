@@ -49,15 +49,14 @@ export async function runHousekeeping(
     const candidateDls = await tx.query<{ id: number }>(candidateDlSql, candidateDlParams);
     let deadLetteredCount = 0;
     if (candidateDls.length > 0) {
-      const ids = candidateDls.map((d) => d.id);
-      const placeholders = ids.map(() => '?').join(',');
+      const ids = JSON.stringify(candidateDls.map((d) => d.id));
       const res = await tx.execute(
         `UPDATE message_deliveries
          SET status = 'DEAD_LETTER',
              dead_letter_reason = 'Delivery expired unacknowledged past dead-letter threshold',
              dead_letter_at = ?
-         WHERE id IN (${placeholders})`,
-        [now, ...ids]
+         WHERE status = 'STORED' AND id IN (SELECT value FROM json_each(?))`,
+        [now, ids]
       );
       deadLetteredCount = res.changes;
     }
@@ -78,8 +77,7 @@ export async function runHousekeeping(
     const candidateDels = await tx.query<{ id: number }>(candidateDelSql, candidateDelParams);
     let archivedDelCount = 0;
     if (candidateDels.length > 0) {
-      const ids = candidateDels.map((d) => d.id);
-      const placeholders = ids.map(() => '?').join(',');
+      const ids = JSON.stringify(candidateDels.map((d) => d.id));
       const archiveRes = await tx.execute(
         `INSERT OR IGNORE INTO archived_deliveries
          (id, project_id, message_id, sender_id, recipient_id, channel_id, sequence,
@@ -89,14 +87,15 @@ export async function runHousekeeping(
                 status, delivered_at, received_at, acknowledged_at, acknowledgement_note,
                 dead_letter_reason, dead_letter_at, ?
          FROM message_deliveries
-         WHERE id IN (${placeholders})`,
-        [now, ...ids]
+         WHERE status = 'ACKNOWLEDGED' AND id IN (SELECT value FROM json_each(?))`,
+        [now, ids]
       );
       archivedDelCount = archiveRes.changes;
 
       await tx.execute(
-        `DELETE FROM message_deliveries WHERE id IN (${placeholders})`,
-        ids
+        `DELETE FROM message_deliveries
+         WHERE status = 'ACKNOWLEDGED' AND id IN (SELECT value FROM json_each(?))`,
+        [ids]
       );
     }
 

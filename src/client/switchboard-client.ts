@@ -709,6 +709,8 @@ export class SwitchboardClient {
     }
   }
 
+  private authenticationRejected = false;
+
   private async executeSync(): Promise<SyncResponse> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -734,6 +736,8 @@ export class SwitchboardClient {
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
+
+      this.authenticationRejected = res.status === 401 || res.status === 403;
 
       // Handle 429 Throttle & Retry-After header
       if (res.status === 429) {
@@ -846,6 +850,7 @@ export class SwitchboardClient {
           }
         }
       } catch {
+        if (this.authenticationRejected) return;
         if (this.retryAfterDelayMs > 0) {
           nextDelay = this.retryAfterDelayMs;
         } else {

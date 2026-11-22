@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { SwitchboardPlug } from '../../src/plug/switchboard-plug.js';
 import { MemoryClientStorage } from '../../src/client/switchboard-client.js';
 
-describe('Live Staging Server Connectivity & Error Contract', () => {
-  const stagingUrl = 'https://switchboard-staging.matthewjameswatkins1978.workers.dev';
+const stagingUrl = process.env.SWITCHBOARD_TEST_STAGING_URL;
+describe.skipIf(!stagingUrl)('Live Staging Server Connectivity & Error Contract', () => {
 
   it('verifies live staging liveness and capability discovery', async () => {
     // 1. Live health check
@@ -30,8 +30,8 @@ describe('Live Staging Server Connectivity & Error Contract', () => {
     const memory = new MemoryClientStorage();
     const plug = new SwitchboardPlug(
       {
-        baseUrl: stagingUrl,
-        endpointId: 'antigravity',
+        baseUrl: stagingUrl!,
+        endpointId: 'staging-test-endpoint',
         token: 'unregistered-probe-token-xyz',
       },
       memory

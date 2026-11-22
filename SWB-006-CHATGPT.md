@@ -2,7 +2,7 @@
 
 ## Staging registration
 
-Target MCP URL: https://switchboard-staging.matthewjameswatkins1978.workers.dev/mcp/chatgpt
+Target MCP URL: https://switchboard-staging.example.com/mcp/chatgpt
 
 After the OAuth-enabled staging version is live, open ChatGPT Plugins, select
 **+ → Add custom MCP server**, and enter these settings.
@@ -33,13 +33,13 @@ and [plugin connection](https://developers.openai.com/plugins/deploy/connect-cha
 
 ## Deploy and roll back
 
-Use the existing staging Worker and its current D1 binding. The `lucy-chat`
+Use the existing staging Worker and its current D1 binding. The `chatgpt-fixture`
 agent must already exist in the designated staging project. The OAuth route is
 disabled unless all four configuration values and the dedicated KV binding are
 present, along with the rate limiting binding. Set these only on staging.
 
 - `CHATGPT_OAUTH_ORIGIN` is the staging HTTPS origin without a trailing slash.
-- `CHATGPT_OAUTH_PROJECT` is the existing staging project that owns `lucy-chat`.
+- `CHATGPT_OAUTH_PROJECT` is the existing staging project that owns the configured ChatGPT endpoint.
 - `CHATGPT_OAUTH_REDIRECTS` is a comma-separated list of exact approved callbacks.
 - `CHATGPT_OAUTH_OWNER_HASH` is a Worker secret containing the lowercase SHA-256
   digest of a locally generated, uniformly random owner passphrase of at least
@@ -79,7 +79,7 @@ continue to use `/mcp`.
 ## Acceptance
 
 In a fresh ordinary Chat conversation, explicitly select the personal plugin
-and ask it to call `get_status` for `lucy-chat`, `list_endpoints`, and
+and ask it to call `get_status` for your configured endpoint, `list_endpoints`, and
 `get_inbox` with a limit of 1. Ask it to return the three Switchboard receipt
 IDs without quoting message content. Match each ID and tool name to an
 independent `switchboard.oauth.tool` Worker console event. Repeat in a fresh

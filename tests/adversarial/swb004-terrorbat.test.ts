@@ -13,6 +13,7 @@ import type { AuthPrincipal } from '../../src/core/types.js';
 import { SwitchboardError } from '../../src/core/errors.js';
 import { execSync } from 'node:child_process';
 import { unstable_dev } from 'wrangler';
+import { convertV4MiniflareOptions, Miniflare } from 'miniflare';
 
 function createD1Mock(): D1DatabaseLike {
   const memAdapter = new SqliteAdapter(':memory:');
@@ -104,6 +105,61 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
     try {
       await fs.rm(testBackupDir, { recursive: true, force: true });
     } catch {}
+  });
+
+  it('processes more than 500 stale deliveries over successive local D1 runs', async () => {
+    const runtime = new Miniflare(convertV4MiniflareOptions({
+      modules: true,
+      script: 'export default { fetch() { return new Response("fixture"); } };',
+      compatibilityDate: '2024-11-01',
+      d1Databases: ['DB'],
+    }));
+    try {
+      const binding = await runtime.getD1Database('DB');
+      const migration = await fs.readFile('src/db/migrations/0001_initial_schema.sql', 'utf8');
+      await binding.batch(migration.split(';').map(sql => sql.trim()).filter(Boolean).map(sql => binding.prepare(sql)));
+      const database = new D1Adapter(binding);
+      const auth = new AuthService(database);
+      await auth.createProject(projectId, 'Housekeeping fixture');
+      await auth.registerEndpoint(projectId, 'sender', 'Sender', 'agent');
+      await auth.registerEndpoint(projectId, 'receiver', 'Receiver', 'agent');
+      const old = Date.now() - 40 * 86_400_000;
+      await database.execute(
+        `WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 501)
+         INSERT INTO messages
+           (id, sender_id, project_id, recipient_type, recipient_id, kind, subject, payload, payload_hash, envelope_hash, priority, created_at)
+         SELECT 'fixture-' || n, 'sender', ?, 'endpoint', 'receiver', 'fixture.v1', 'Fixture', '{}', 'fixture', 'fixture', 'normal', ?
+         FROM sequence`,
+        [projectId, old]
+      );
+      await database.execute(
+        `WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 501)
+         INSERT INTO message_deliveries
+           (project_id, message_id, sender_id, recipient_id, sequence, status, delivered_at)
+         SELECT ?, 'fixture-' || n, 'sender', 'receiver', n, 'STORED', ? FROM sequence`,
+        [projectId, old]
+      );
+      const count = (status: string) => database.queryFirst<{ total: number }>(
+        'SELECT COUNT(*) AS total FROM message_deliveries WHERE status = ?', [status]
+      );
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 100 });
+      expect(await count('DEAD_LETTER')).toEqual({ total: 100 });
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 500 });
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 500 });
+      expect(await count('DEAD_LETTER')).toEqual({ total: 501 });
+      expect(await count('STORED')).toEqual({ total: 0 });
+      expect(await database.queryFirst('SELECT COUNT(*) AS total FROM messages')).toEqual({ total: 501 });
+      await database.execute("UPDATE message_deliveries SET status = 'ACKNOWLEDGED', acknowledged_at = ?", [old]);
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 500 });
+      expect(await count('ACKNOWLEDGED')).toEqual({ total: 1 });
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 500 });
+      await runHousekeeping(database, { projectId, maxItemsPerRun: 500 });
+      expect(await database.queryFirst('SELECT COUNT(*) AS total FROM archived_deliveries')).toEqual({ total: 501 });
+      expect(await database.queryFirst('SELECT COUNT(*) AS total FROM archived_messages')).toEqual({ total: 501 });
+      expect(await count('ACKNOWLEDGED')).toEqual({ total: 0 });
+    } finally {
+      await runtime.dispose();
+    }
   });
 
   // 1. D1 Batch Sequencing Collision

@@ -9,6 +9,56 @@ import { it, expect } from 'vitest';
 import { createCodexPlug } from '../../src/mcp/codex-plug.js';
 import { startServer } from '../../src/server/node-server.js';
 
+it.each([401, 403])('holds the durable queue after HTTP %s until explicit repair', async httpStatus => {
+  const directory = mkdtempSync(join(tmpdir(), 'switchboard-auth-'));
+  let requests = 0;
+  async function connect() {
+    const plug = createCodexPlug({
+      origin: 'http://127.0.0.1:12345',
+      endpoint: 'sender',
+      token: 'fixture',
+      mailbox: join(directory, 'mailbox.db'),
+      fetch: async () => {
+        requests++;
+        return new Response(null, { status: httpStatus });
+      },
+    });
+    const mcp = new Client({ name: 'fixture', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await plug.server.connect(serverTransport);
+    await mcp.connect(clientTransport);
+    return {
+      call: async (name: string, args: Record<string, unknown> = {}) => {
+        const response = await mcp.callTool({ name, arguments: args });
+        expect(response.isError).not.toBe(true);
+        return response.structuredContent;
+      },
+      close: async () => {
+        await mcp.close();
+        await plug.server.close();
+        plug.close();
+      },
+    };
+  }
+  let peer = await connect();
+  try {
+    await peer.call('queue_message', {
+      id: 'fixture', recipientType: 'endpoint', recipientId: 'recipient',
+      kind: 'fixture.v1', subject: 'Fixture', payload: {},
+    });
+    expect(await peer.call('sync')).toMatchObject({ outcome: 'failed' });
+    await peer.close();
+    peer = await connect();
+    expect(await peer.call('sync')).toMatchObject({ outcome: 'auth_blocked', pending: { outgoing: 1 } });
+    expect(requests).toBe(1);
+    expect(await peer.call('sync', { retryAuthentication: true })).toMatchObject({ outcome: 'failed' });
+    expect(requests).toBe(2);
+  } finally {
+    await peer.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 it('replays a committed send after response loss, persists inbox and acks, and gates idle polling', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'switchboard-codex-'));
   const service = await startServer({

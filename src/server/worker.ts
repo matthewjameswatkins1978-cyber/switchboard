@@ -98,14 +98,12 @@ export default {
   },
 
   async scheduled(_event: any, env: Env, _ctx: any): Promise<void> {
+    if (isPausedSetting(env.SWITCHBOARD_PAUSED)) return;
     const db = new D1Adapter(env.DB);
-    const service = new SwitchboardService(db);
     await runHousekeeping(db, {
       projectId: env.PROJECT_ID,
       maxItemsPerRun: 500,
     });
-    if (env.PROJECT_ID) {
-      await service.createScheduledBackup(env.PROJECT_ID);
-    }
+    // Hosted recovery uses an operator export stored outside the primary D1 database.
   },
 };

@@ -7,7 +7,7 @@ description: Antigravity native integration with Switchboard for addressed messa
 
 Switchboard provides durable addressed messaging, bounded synchronization, explicit acknowledgements, and presence coordination between **Antigravity**, **Pi (Muse)**, and **ChatGPT (Lucy)**.
 
-- **Staging Server:** `https://switchboard-staging.matthewjameswatkins1978.workers.dev`
+- **Staging Server:** `https://switchboard-staging.example.com`
 - **Protocol Version:** 1
 - **Local Storage:** `~/.switchboard/state-antigravity.json`
 - **Transport Invariant:** No LLM inference for transport; pure deterministic delivery.

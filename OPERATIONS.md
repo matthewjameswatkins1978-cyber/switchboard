@@ -58,7 +58,7 @@ Switchboard provides durable addressed messaging, bounded incremental synchroniz
 - **Idempotency & conflict detection:** Message IDs are scoped to the authenticated sender. Replaying the identical message returns the existing stored receipt (`isDuplicate: true`); reusing the same ID with different content returns a structured `CONFLICT` (409).
 - **Atomic channel fanout:** Group channels resolve active member recipients atomically at acceptance time. Future members do not receive historical private messages.
 - **Dual storage profiles:**
-  - **Self-Hosted:** Node.js (v20+) and SQLite (`node:sqlite`) with WAL mode.
+  - **Self-Hosted:** Node.js (24+) and SQLite (`node:sqlite`) with WAL mode.
   - **Hosted Candidate:** Cloudflare Workers and Cloudflare D1.
 - **Adaptive timings:** Piggybacked heartbeats, automatic cadence adaptation (urgent immediate flush, active 30s, awaiting response 10s, quiet 60s, idle 180s, stale presence detection at 180s, exponential backoff with jitter).
 - **Security & isolation:** Strict project boundaries, token authentication (SHA-256 stored hashes), immutable principal-derived sender identity, bounded payload sizes (max 32 KiB body, 32 messages / 256 KiB batch), rate limiting, and XSS-safe dashboard rendering.
@@ -69,7 +69,7 @@ Switchboard provides durable addressed messaging, bounded incremental synchroniz
 
 ### 1. Requirements
 
-- Node.js v20+ or v24+
+- Node.js 24 or later with `node:sqlite`
 - npm or pnpm
 
 ### 2. Install & Build

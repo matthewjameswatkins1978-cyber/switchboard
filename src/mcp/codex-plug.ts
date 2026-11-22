@@ -34,7 +34,7 @@ export function createCodexPlug(config: {
   const initial = {
     presence: StatusUpdateInputSchema.parse({ state: 'available' }), dirty: false,
     requests: 0, requestBytes: 0, responseBytes: 0, failures: 0, retryAt: 0, nextPollAt: 0, more: false,
-    cursor: undefined as string | undefined, lastSuccessAt: 0, lastError: '', lastLatencyMs: 0,
+    authBlocked: false, cursor: undefined as string | undefined, lastSuccessAt: 0, lastError: '', lastLatencyMs: 0,
   };
   const identity = JSON.stringify([origin.origin, endpoint]);
   if (!db.prepare('SELECT id FROM mailbox WHERE id = 1').get()) {
@@ -140,14 +140,23 @@ export function createCodexPlug(config: {
 
   server.registerTool('sync', {
     description: 'Sync one batch when due. Invoke at session checkpoints. Queued work can sync ahead of the idle cadence.',
-    inputSchema: {},
-  }, async () => {
+    inputSchema: { retryAuthentication: z.boolean().optional().describe('Retry once after explicitly repairing credentials.') },
+  }, async ({ retryAuthentication }) => {
     writable();
     beginWrite();
     syncing = true;
     try {
       const state = read();
       const backlog = pending();
+      if (state.authBlocked && !retryAuthentication) {
+        db.exec('COMMIT');
+        return result({ outcome: 'auth_blocked', error: state.lastError, pending: backlog });
+      }
+      if (state.authBlocked && retryAuthentication) {
+        state.authBlocked = false;
+        state.retryAt = 0;
+        state.nextPollAt = 0;
+      }
       if (now() < state.retryAt || (now() < state.nextPollAt && !state.more && !state.dirty &&
           !backlog.outgoing && !backlog.acknowledgements)) {
         db.exec('COMMIT');
@@ -183,6 +192,7 @@ export function createCodexPlug(config: {
           body, redirect: 'error', signal: AbortSignal.timeout(15000),
         });
         if (!reply.ok) {
+          state.authBlocked = reply.status === 401 || reply.status === 403;
           const after = reply.headers.get('retry-after');
           if (after && /^\d+$/.test(after)) state.retryAt = now() + Number(after) * 1000;
           throw new Error('Switchboard sync returned HTTP ' + reply.status);
@@ -200,7 +210,7 @@ export function createCodexPlug(config: {
       } catch (error) {
         state.lastError = error instanceof Error ? error.message : 'Sync failed.';
         state.failures++;
-        state.retryAt = Math.max(state.retryAt, now() + calculateExponentialBackoffWithJitter(state.failures));
+        state.retryAt = state.authBlocked ? 0 : Math.max(state.retryAt, now() + calculateExponentialBackoffWithJitter(state.failures));
         const latencyMs = Math.round(performance.now() - started);
         save({ ...state, lastLatencyMs: latencyMs });
         db.exec('COMMIT');

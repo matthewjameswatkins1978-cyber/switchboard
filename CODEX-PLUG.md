@@ -51,7 +51,7 @@ a second hash. See the server README for the REST and remote MCP interfaces.
 - Call `queue_message` with the addressed v1 envelope and a durable,
   caller-generated idempotency ID. For a reply, retain the original thread ID
   and set `replyToId` to the original message's ID. Call `sync` after queueing,
-  immediately for urgent messages. Use the returned STORED receipt to verify
+  immediately for urgent messages. If sync reports `auth_blocked`, repair the configured credentials and call `sync` once with `retryAuthentication: true`. The mailbox preserves the queue and the authentication hold across restarts. Use the returned STORED receipt to verify
   send completion. Report any item errors returned by sync.
 - Page through `inbox` using `nextAfter`. To confirm receipt, call
   `queue_ack` with the message and original sender IDs, then `sync`.
