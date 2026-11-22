@@ -1,4 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
+import type { DurableObjectNamespace, Request as WorkerRequest } from '@cloudflare/workers-types';
 import type { OAuthProvider, OAuthProviderOptions } from '@cloudflare/workers-oauth-provider';
 import { sha256 } from './auth-service.js';
 import type { AuthPrincipal } from '../core/types.js';
@@ -23,6 +24,8 @@ export interface ChatGptOAuthEnv {
   CHATGPT_OAUTH_REDIRECTS?: string;
   CHATGPT_OAUTH_OWNER_HASH?: string;
   OAUTH_KV?: unknown;
+  CHATGPT_OAUTH_STATE?: DurableObjectNamespace;
+  CHATGPT_OAUTH_DISABLED?: string;
   CHATGPT_OAUTH_LIMIT?: { limit(input: { key: string }): Promise<{ success: boolean }> };
 }
 
@@ -37,9 +40,13 @@ export async function routeChatGptOAuth(
   env: ChatGptOAuthEnv,
   ctx: OAuthContext | undefined,
   serve: (request: Request, principal: AuthPrincipal) => Promise<Response>,
+  routedThroughState = false,
 ): Promise<Response | undefined> {
   const url = new URL(request.url);
   if (!oauthPaths.has(url.pathname)) return;
+  if (env.CHATGPT_OAUTH_DISABLED === '1') {
+    return new Response(null, { status: 503, headers: { 'Retry-After': '30', 'Cache-Control': 'no-store' } });
+  }
   const origin = env.CHATGPT_OAUTH_ORIGIN;
   const projectId = env.CHATGPT_OAUTH_PROJECT;
   const ownerHash = env.CHATGPT_OAUTH_OWNER_HASH;
@@ -50,9 +57,14 @@ export async function routeChatGptOAuth(
   }
   if (url.pathname === routes.mcp && url.search) return new Response(null, { status: 400 });
 
-  if (limitedPaths.has(url.pathname)) {
+  if (!routedThroughState && limitedPaths.has(url.pathname)) {
     const { success } = await env.CHATGPT_OAUTH_LIMIT.limit({ key: url.pathname });
     if (!success) return new Response(null, { status: 429, headers: { 'Retry-After': '60' } });
+  }
+
+  if (!routedThroughState && env.CHATGPT_OAUTH_STATE) {
+    const state = env.CHATGPT_OAUTH_STATE;
+    return state.get(state.idFromName('chatgpt-oauth')).fetch(request as unknown as WorkerRequest) as unknown as Promise<Response>;
   }
 
   const { AuthorizationError, OAuthError, OAuthProvider, getOAuthApi } =
@@ -80,7 +92,7 @@ export async function routeChatGptOAuth(
     authorizeEndpoint: routes.authorize,
     tokenEndpoint: routes.token,
     clientRegistrationEndpoint: routes.register,
-    accessTokenTTL: 600,
+    accessTokenTTL: 3600,
     refreshTokenTTL: 604800,
     clientRegistrationCallback({ clientMetadata }) {
       const uris = clientMetadata.redirect_uris;

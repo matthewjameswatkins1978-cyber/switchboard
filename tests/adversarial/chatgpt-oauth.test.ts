@@ -28,27 +28,31 @@ const form = (fields: Record<string, string>, headers?: Record<string, string>) 
   body: new URLSearchParams(fields),
 });
 
+const runtimeOptions = (strong = false, disabled = false) => convertV4MiniflareOptions({
+  modules: true,
+  handleStructuredLogs: (event) => serverLogs.push(JSON.stringify(event)),
+  scriptPath: join(temporary, 'worker.js'),
+  compatibilityDate: '2024-11-01',
+  compatibilityFlags: ['nodejs_compat'],
+  d1Databases: ['DB'],
+  kvNamespaces: ['OAUTH_KV'],
+  ratelimits: { CHATGPT_OAUTH_LIMIT: { namespace_id: '106', simple: { limit: 60, period: 60 } } },
+  durableObjects: strong ? { CHATGPT_OAUTH_STATE: { className: 'ChatGptOAuthState', useSQLite: true } } : {},
+  resourcePersistencePath: join(temporary, 'persist'),
+
+  bindings: {
+    CHATGPT_OAUTH_DISABLED: disabled ? '1' : '0',
+    CHATGPT_OAUTH_ORIGIN: origin,
+    CHATGPT_OAUTH_PROJECT: 'fictional-workshop',
+    CHATGPT_OAUTH_REDIRECTS: redirect,
+    CHATGPT_OAUTH_OWNER_HASH: digest(owner).digest('hex'),
+  },
+});
+
 beforeAll(async () => {
   execFileSync(process.execPath, ['node_modules/wrangler/bin/wrangler.js', 'deploy', '--dry-run',
     '--outdir', temporary], { stdio: 'pipe' });
-  runtime = new Miniflare(convertV4MiniflareOptions({
-    modules: true,
-    handleStructuredLogs: (event) => serverLogs.push(JSON.stringify(event)),
-    scriptPath: join(temporary, 'worker.js'),
-    compatibilityDate: '2024-11-01',
-    compatibilityFlags: ['nodejs_compat'],
-    d1Databases: ['DB'],
-    d1Persist: join(temporary, 'd1'),
-    kvNamespaces: ['OAUTH_KV'],
-    ratelimits: { CHATGPT_OAUTH_LIMIT: { namespace_id: '106', simple: { limit: 60, period: 60 } } },
-    kvPersist: join(temporary, 'kv'),
-    bindings: {
-      CHATGPT_OAUTH_ORIGIN: origin,
-      CHATGPT_OAUTH_PROJECT: 'fictional-workshop',
-      CHATGPT_OAUTH_REDIRECTS: redirect,
-      CHATGPT_OAUTH_OWNER_HASH: digest(owner).digest('hex'),
-    },
-  }));
+  runtime = new Miniflare(runtimeOptions());
   const d1 = await runtime.getD1Database('DB');
   const migration = readFileSync('src/db/migrations/0001_initial_schema.sql', 'utf8');
   await d1.batch(migration.split(';').map(sql => sql.trim()).filter(Boolean).map(sql => d1.prepare(sql)));
@@ -125,7 +129,7 @@ it('qualifies OAuth discovery, approval, isolation, messaging and revocation in 
   const token = await exchange();
   expect(token.status).toBe(200);
   const { access_token, refresh_token, expires_in } = await token.json();
-  expect(expires_in).toBe(600);
+  expect(expires_in).toBe(3600);
   expect((await request('/mcp', { headers: { Authorization: 'Bearer ' + access_token } })).status).toBe(401);
 
   const connect = async (url: string, token: string) => {
@@ -196,18 +200,88 @@ it('qualifies OAuth discovery, approval, isolation, messaging and revocation in 
   }
   await kv.put(key, JSON.stringify(active));
   expect((await refresh({ scope: 'admin' })).status).toBe(400);
-  const refreshed = await refresh();
-  expect(refreshed.status).toBe(200);
-  const replacement = await refreshed.json();
+  const grantKey = 'grant:' + userId + ':' + grantId;
+  const staleGrant = (await kv.get(grantKey))!;
+  const firstRefresh = await refresh();
+  expect(firstRefresh.status).toBe(200);
+  const firstReplacement = await firstRefresh.json();
+  const currentGrant = (await kv.get(grantKey))!;
+  // Simulate an edge reading the grant snapshot from before the rotation.
+  await kv.put(grantKey, staleGrant);
+  const staleRead = await refresh({ refresh_token: firstReplacement.refresh_token });
+  expect(staleRead.status).toBe(400);
+  expect(await staleRead.json()).toMatchObject({ error: 'invalid_grant' });
+  await kv.put(grantKey, currentGrant);
+  const retry = await refresh();
+  expect(retry.status).toBe(200);
+  const replacement = await retry.json();
+  // Simulate a delayed first response winning after a retry of the same request.
+  const orphaned = await refresh({ refresh_token: firstReplacement.refresh_token });
+  expect(orphaned.status).toBe(400);
+  expect(await orphaned.json()).toMatchObject({ error: 'invalid_grant' });
+  await expect.poll(() => serverLogs.some(log =>
+    log.includes('switchboard.oauth.token_error') && log.includes('refresh_token_mismatch'),
+  )).toBe(true);
   expect(replacement.scope).toBe('switchboard');
   expect(replacement.refresh_token).not.toBe(refresh_token);
-  const refreshedClient = await connect(resource, replacement.access_token);
+  // Cut over an existing client, grant and access token without owner approval.
+  await runtime.setOptions(runtimeOptions(true, true));
+  expect((await request('/mcp/chatgpt')).status).toBe(503);
+  const legacyWhilePaused = await connect(origin + '/mcp', bearer);
+  await legacyWhilePaused.close();
+  await runtime.setOptions(runtimeOptions(true));
+  const carried = await connect(resource, replacement.access_token);
+  try {
+    for (let index = 0; index < 20; index++) {
+      const result = await carried.callTool({ name: 'get_status', arguments: { endpoint_id: 'lucy-chat' } });
+      expect(result.isError).not.toBe(true);
+      expect(result._meta?.['switchboard/receipt']).toMatch(/^[\da-f-]{36}$/);
+    }
+  } finally {
+    await carried.close();
+  }
+  const renew = (refreshToken: string, extra: Record<string, string> = {}) =>
+    refresh({ refresh_token: refreshToken, ...extra });
+  const [concurrentA, concurrentB] = await Promise.all([
+    renew(replacement.refresh_token), renew(replacement.refresh_token),
+  ]);
+  expect(concurrentA.status).toBe(200);
+  expect(concurrentB.status).toBe(200);
+  const rotation = await concurrentA.json();
+  const duplicate = await concurrentB.json();
+  expect(duplicate.access_token === rotation.access_token && duplicate.refresh_token === rotation.refresh_token).toBe(true);
+  expect((await renew(replacement.refresh_token, { resource: origin + '/mcp' })).status).toBe(400);
+  expect((await renew(replacement.refresh_token, { client_id: 'wrong-client' })).status).toBe(400);
+  expect((await renew(replacement.refresh_token, { scope: 'admin' })).status).toBe(400);
+  // Drop the successful response, recreate the isolate, and retry twice.
+  await runtime.dispose();
+  runtime = new Miniflare(runtimeOptions(true));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const replay = await renew(replacement.refresh_token);
+    if (replay.status !== 200) throw new Error('Restart replay HTTP ' + replay.status + ': ' + await replay.text());
+    const replayed = await replay.json();
+    expect(replayed.access_token === rotation.access_token && replayed.refresh_token === rotation.refresh_token).toBe(true);
+  }
+  let latest = rotation;
+  for (let turn = 0; turn < 3; turn++) {
+    const next = await renew(latest.refresh_token);
+    expect(next.status).toBe(200);
+    latest = await next.json();
+    expect(latest.scope).toBe('switchboard');
+  }
+  expect((await renew(replacement.refresh_token)).status).toBe(400);
+  const refreshedClient = await connect(resource, latest.access_token);
   await refreshedClient.close();
+  const migratedKv = await runtime.getKVNamespace('OAUTH_KV');
+  await migratedKv.put(key, JSON.stringify({ ...active, expiresAt: 1 }));
+  expect((await verifyToken()).status).toBe(401);
+  await migratedKv.put(key, JSON.stringify(active));
   const revoke = await request(path(issuer.revocation_endpoint),
-    form({ token: replacement.refresh_token, client_id }));
+    form({ token: latest.refresh_token, client_id }));
   expect(revoke.status).toBe(200);
   expect((await refresh({ refresh_token: replacement.refresh_token })).status).toBe(400);
-  for (const token of [access_token, replacement.access_token]) {
+  expect((await renew(latest.refresh_token)).status).toBe(400);
+  for (const token of [access_token, replacement.access_token, rotation.access_token, latest.access_token]) {
     expect((await request('/mcp/chatgpt', { headers: { Authorization: 'Bearer ' + token } })).status).toBe(401);
   }
   const auditLogs = serverLogs.filter(log => log.includes('switchboard.oauth.tool')).join(' ');

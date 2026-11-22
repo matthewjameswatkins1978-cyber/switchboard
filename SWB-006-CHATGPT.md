@@ -72,7 +72,7 @@ RFC 7009 revocation is available at the advertised token URL. Allow for Workers
 KV propagation on edge revocation.
 
 The OAuth token grants the normal agent's messaging access in that project.
-Access tokens expire after ten minutes and refresh grants after seven days.
+New access tokens expire after one hour and refresh grants after seven days.
 OAuth grants cannot mint static bearer credentials. Existing bearer clients
 continue to use `/mcp`.
 
@@ -93,3 +93,34 @@ directions. Local runtime coverage is in
 `tests/adversarial/chatgpt-oauth.test.ts`. The test runs the bundled Worker with
 persisted D1 and KV, and exercises the normal MCP SDK over Streamable HTTP.
 Native Chat and Work acceptance are separate from this test.
+
+## SWB-007 refresh persistence
+
+The staging Worker uses a SQLite-backed Durable Object bound as
+`CHATGPT_OAUTH_STATE`. Keep `OAUTH_KV` bound as a read-only migration source.
+Durable revocation records fence reads of old grants and tokens. Legacy
+fallback ends 91 days after the actor is initialized.
+
+Token requests are serialized. An exact refresh retry within two minutes
+receives the same successor while its grant and access token are current
+and active. The stored response is encrypted using a key derived from the
+presented refresh credential. The window does not extend either lifetime.
+The provider validates the client, resource, scope and approval on the
+initial exchange. Prior credentials outside the retry window are rejected.
+
+Use the private staging config with a `new_sqlite_classes` migration for
+`ChatGptOAuthState` and `CHATGPT_OAUTH_DISABLED=1` for the initial
+`wrangler deploy`. That version fences the old KV writer while keeping
+static bearer routes available. After the KV propagation window, upload
+and promote the same commit at 100% with `CHATGPT_OAUTH_DISABLED=0`.
+Roll back to the paused version if needed. Returning to a pre-migration
+KV writer can revive stale state, including grants revoked after cutover.
+
+Token diagnostics emit provider classifications and fixed policy booleans
+to the console. Correlate fresh Chat and Work receipt IDs to Worker events
+without capturing message contents or request data.
+
+The adversarial test reproduces stale KV reads and delayed duplicate replies
+before cutover. The Durable Object phase verifies 20 authenticated calls,
+repeated rotation, concurrent refresh, retry across a process restart,
+expiry and revocation of pre-cutover and newly issued credentials.
