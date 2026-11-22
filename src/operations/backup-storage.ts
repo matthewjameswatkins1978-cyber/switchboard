@@ -2,12 +2,18 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { BackupRecord } from '../core/types.js';
 
+export type BackupStorageType = 'local_external' | 'hosted_database';
+
 export interface BackupStorage {
   saveBackup(record: BackupRecord): Promise<void>;
   loadBackup(backupId: string, projectId: string): Promise<BackupRecord | null>;
   listBackups(projectId: string): Promise<Array<Omit<BackupRecord, 'manifestJson'>>>;
 }
 
+/**
+ * Local filesystem backup storage for self-hosted Node.js deployments.
+ * Stores atomic JSON backup snapshots outside the primary SQLite database.
+ */
 export class FileBackupStorage implements BackupStorage {
   private baseDir: string;
 
@@ -24,7 +30,7 @@ export class FileBackupStorage implements BackupStorage {
     await fs.mkdir(projDir, { recursive: true });
     const filePath = path.join(projDir, `${record.id}.json`);
     const tempPath = `${filePath}.${Date.now()}.tmp`;
-    const data = JSON.stringify(record, null, 2);
+    const data = JSON.stringify({ ...record, storageType: 'local_external' as const }, null, 2);
     await fs.writeFile(tempPath, data, 'utf8');
     await fs.rename(tempPath, filePath);
   }
@@ -34,7 +40,8 @@ export class FileBackupStorage implements BackupStorage {
     const filePath = path.join(projDir, `${backupId}.json`);
     try {
       const content = await fs.readFile(filePath, 'utf8');
-      return JSON.parse(content) as BackupRecord;
+      const parsed = JSON.parse(content) as BackupRecord;
+      return { ...parsed, storageType: 'local_external' };
     } catch {
       return null;
     }
@@ -57,6 +64,7 @@ export class FileBackupStorage implements BackupStorage {
             version: parsed.version,
             checksumSha256: parsed.checksumSha256,
             createdAt: parsed.createdAt,
+            storageType: 'local_external',
           });
         } catch {
           // Skip invalid backup files

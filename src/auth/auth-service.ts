@@ -118,13 +118,39 @@ export class AuthService {
     const now = Date.now();
     const expiresAt = expiresInMs ? now + expiresInMs : null;
 
+    const existing = await this.db.queryFirst<{
+      endpoint_id: string;
+      project_id: string;
+      revoked: number;
+    }>(
+      `SELECT endpoint_id, project_id, revoked FROM credentials WHERE token_hash = ?`,
+      [tokenHash]
+    );
+
+    if (existing) {
+      if (existing.revoked === 1) {
+        throw new SwitchboardError(
+          'CONFLICT',
+          'Cannot issue or reactivate a revoked token'
+        );
+      }
+      if (existing.endpoint_id !== endpointId || existing.project_id !== projectId) {
+        throw new SwitchboardError(
+          'CONFLICT',
+          'Cannot issue token: token is already assigned to a different endpoint'
+        );
+      }
+      // Update existing active token scopes and expiry, never reactivating revoked
+      await this.db.execute(
+        `UPDATE credentials SET scopes = ?, expires_at = ? WHERE token_hash = ? AND revoked = 0`,
+        [JSON.stringify(scopes), expiresAt, tokenHash]
+      );
+      return;
+    }
+
     await this.db.execute(
       `INSERT INTO credentials (token_hash, endpoint_id, project_id, scopes, expires_at, revoked, created_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?)
-       ON CONFLICT(token_hash) DO UPDATE SET
-         scopes = excluded.scopes,
-         expires_at = excluded.expires_at,
-         revoked = 0`,
+       VALUES (?, ?, ?, ?, ?, 0, ?)`,
       [tokenHash, endpointId, projectId, JSON.stringify(scopes), expiresAt, now]
     );
   }
@@ -163,14 +189,22 @@ export class AuthService {
         );
       }
 
-      // 1. Issue new token
+      // Check if replacement token has already been used (active, expired, or revoked)
+      const existingNew = await tx.queryFirst<{ revoked: number }>(
+        `SELECT revoked FROM credentials WHERE token_hash = ?`,
+        [newTokenHash]
+      );
+      if (existingNew) {
+        throw new SwitchboardError(
+          'CONFLICT',
+          'Cannot use previously used credential as replacement token; replacement tokens must be fresh and unused'
+        );
+      }
+
+      // 1. Issue new token (must be fresh)
       await tx.execute(
         `INSERT INTO credentials (token_hash, endpoint_id, project_id, scopes, expires_at, revoked, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?)
-         ON CONFLICT(token_hash) DO UPDATE SET
-           scopes = excluded.scopes,
-           expires_at = excluded.expires_at,
-           revoked = 0`,
+         VALUES (?, ?, ?, ?, ?, 0, ?)`,
         [newTokenHash, endpointId, projectId, JSON.stringify(scopes), newExpiresAt, now]
       );
 

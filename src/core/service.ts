@@ -55,15 +55,19 @@ export class SwitchboardService {
   constructor(
     db: DatabaseSession,
     metrics: MetricsCollector = MetricsCollector.getInstance(),
-    backupStorage?: BackupStorage
+    backupStorage?: BackupStorage | null
   ) {
     this.db = db;
     this.metrics = metrics;
-    this.backupStorage =
-      backupStorage ??
-      (typeof process !== 'undefined' && process.release?.name === 'node'
-        ? new FileBackupStorage()
-        : undefined);
+    if (backupStorage === null) {
+      this.backupStorage = undefined;
+    } else {
+      this.backupStorage =
+        backupStorage ??
+        (typeof process !== 'undefined' && process.release?.name === 'node'
+          ? new FileBackupStorage()
+          : undefined);
+    }
   }
 
   get database(): DatabaseSession {
@@ -1712,7 +1716,15 @@ export class SwitchboardService {
   }
 
   /**
-   * Create a scheduled or manual backup with full integrity manifest
+   * Create a scheduled or manual backup with full integrity manifest.
+   *
+   * Note on Hosting Profiles:
+   * - In self-hosted Node.js: backups are persisted externally to local filesystem storage
+   *   via FileBackupStorage ('local_external'), providing true out-of-band disaster recovery.
+   * - In Cloudflare Workers / D1: backups are recorded into the primary D1 database
+   *   table 'backups' ('hosted_database'). Independent hosted disaster recovery outside D1
+   *   requires external object storage (e.g. Cloudflare R2), which has not yet been demonstrated.
+   *   Until demonstrated, hosted backups remain within primary storage or via admin file export/import.
    */
   async createScheduledBackup(projectId: string): Promise<BackupRecord> {
     const exportData = await this.exportData({
@@ -1725,6 +1737,7 @@ export class SwitchboardService {
     const backupId = `bk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const now = Date.now();
     const manifestJson = JSON.stringify(exportData);
+    const storageType = this.backupStorage ? 'local_external' : 'hosted_database';
 
     const record: BackupRecord = {
       id: backupId,
@@ -1733,6 +1746,7 @@ export class SwitchboardService {
       checksumSha256: exportData.checksumSha256,
       manifestJson,
       createdAt: now,
+      storageType,
     };
 
     // 1. Primary database table backup
@@ -1778,6 +1792,7 @@ export class SwitchboardService {
         version: r.version,
         checksumSha256: r.checksum_sha256,
         createdAt: r.created_at,
+        storageType: 'hosted_database',
       });
     }
 
@@ -1786,9 +1801,10 @@ export class SwitchboardService {
       try {
         const external = await this.backupStorage.listBackups(principal.projectId);
         for (const ext of external) {
-          if (!map.has(ext.id)) {
-            map.set(ext.id, ext);
-          }
+          map.set(ext.id, {
+            ...ext,
+            storageType: 'local_external',
+          });
         }
       } catch {
         // Fall back to DB backups

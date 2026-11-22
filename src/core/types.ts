@@ -58,6 +58,7 @@ export interface BackupRecord {
   checksumSha256: string;
   manifestJson?: string;
   createdAt: number;
+  storageType?: 'local_external' | 'hosted_database';
 }
 
 export interface StoredReceipt {

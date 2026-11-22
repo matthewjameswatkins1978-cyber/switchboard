@@ -13,6 +13,10 @@ export interface D1DatabaseLike {
   exec(query: string): Promise<{ count: number; duration: number }>;
 }
 
+function sanitizeParams(params: unknown[]): unknown[] {
+  return params.map((p) => (p === undefined ? null : p));
+}
+
 export class D1TransactionSession implements DatabaseSession {
   private d1: D1DatabaseLike;
   private stagedStatements: D1PreparedStatement[] = [];
@@ -27,22 +31,24 @@ export class D1TransactionSession implements DatabaseSession {
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const safeParams = sanitizeParams(params);
+    const stmt = this.d1.prepare(sql).bind(...safeParams);
     const res = await stmt.all<T>();
     return res.results ?? [];
   }
 
   async queryFirst<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | null> {
+    const safeParams = sanitizeParams(params);
     const normalized = sql.replace(/\s+/g, ' ').trim().toUpperCase();
 
     // 1. Transactional visibility: MAX(sequence)
     if (normalized.includes('MAX_SEQ') || (normalized.includes('MAX(SEQUENCE)') && normalized.includes('MESSAGE_DELIVERIES'))) {
-      const stmt = this.d1.prepare(sql).bind(...params);
+      const stmt = this.d1.prepare(sql).bind(...safeParams);
       const row = await stmt.first<any>();
       const dbMax = row?.max_seq ? Number(row.max_seq) : 0;
 
-      const projectId = String(params[0] ?? '');
-      const recipientId = String(params[1] ?? '');
+      const projectId = String(safeParams[0] ?? '');
+      const recipientId = String(safeParams[1] ?? '');
       const key = `${projectId}:${recipientId}`;
       const stagedMax = this.stagedMaxSequence.get(key) ?? 0;
 
@@ -52,9 +58,9 @@ export class D1TransactionSession implements DatabaseSession {
 
     // 2. Transactional visibility: messages check
     if (normalized.includes('FROM MESSAGES') && normalized.includes('PROJECT_ID =') && normalized.includes('SENDER_ID =') && normalized.includes('ID =')) {
-      const projectId = String(params[0] ?? '');
-      const senderId = String(params[1] ?? '');
-      const messageId = String(params[2] ?? '');
+      const projectId = String(safeParams[0] ?? '');
+      const senderId = String(safeParams[1] ?? '');
+      const messageId = String(safeParams[2] ?? '');
       const key = `${projectId}:${senderId}:${messageId}`;
       const staged = this.stagedMessages.get(key);
       if (staged) return staged as T;
@@ -62,20 +68,21 @@ export class D1TransactionSession implements DatabaseSession {
 
     // 3. Transactional visibility: endpoint_status check
     if (normalized.includes('FROM ENDPOINT_STATUS') && normalized.includes('ENDPOINT_ID =') && normalized.includes('PROJECT_ID =')) {
-      const endpointId = String(params[0] ?? '');
-      const projectId = String(params[1] ?? '');
+      const endpointId = String(safeParams[0] ?? '');
+      const projectId = String(safeParams[1] ?? '');
       const key = `${projectId}:${endpointId}`;
       const staged = this.stagedStatuses.get(key);
       if (staged) return staged as T;
     }
 
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const stmt = this.d1.prepare(sql).bind(...safeParams);
     const row = await stmt.first<T>();
     return row ?? null;
   }
 
   async execute(sql: string, params: unknown[] = []): Promise<ExecResult> {
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const safeParams = sanitizeParams(params);
+    const stmt = this.d1.prepare(sql).bind(...safeParams);
     this.stagedStatements.push(stmt);
 
     const normalized = sql.replace(/\s+/g, ' ').trim().toUpperCase();
@@ -83,9 +90,9 @@ export class D1TransactionSession implements DatabaseSession {
     // Track staged delivery sequences for transactional visibility
     if (normalized.startsWith('INSERT INTO MESSAGE_DELIVERIES')) {
       // params: [projectId, messageId, senderId, recipientId, channelId, sequence, status, deliveredAt, ...]
-      const projectId = String(params[0] ?? '');
-      const recipientId = String(params[3] ?? '');
-      const sequence = Number(params[5] ?? 0);
+      const projectId = String(safeParams[0] ?? '');
+      const recipientId = String(safeParams[3] ?? '');
+      const sequence = Number(safeParams[5] ?? 0);
       const key = `${projectId}:${recipientId}`;
       const current = this.stagedMaxSequence.get(key) ?? 0;
       if (sequence > current) {
@@ -94,9 +101,9 @@ export class D1TransactionSession implements DatabaseSession {
     }
 
     if (normalized.includes('ENDPOINT_SEQUENCES')) {
-      const projectId = String(params[0] ?? '');
-      const recipientId = String(params[1] ?? '');
-      const sequence = Number(params[2] ?? 0);
+      const projectId = String(safeParams[0] ?? '');
+      const recipientId = String(safeParams[1] ?? '');
+      const sequence = Number(safeParams[2] ?? 0);
       const key = `${projectId}:${recipientId}`;
       const current = this.stagedMaxSequence.get(key) ?? 0;
       if (sequence > current) {
@@ -107,12 +114,12 @@ export class D1TransactionSession implements DatabaseSession {
     // Track staged messages for transactional visibility
     if (normalized.startsWith('INSERT INTO MESSAGES')) {
       // params: [id, senderId, projectId, recipientType, recipientId, kind, subject, payload, payloadHash, envelopeHash, priority, threadId, replyToId, evidenceRefs, now]
-      const id = String(params[0] ?? '');
-      const senderId = String(params[1] ?? '');
-      const projectId = String(params[2] ?? '');
-      const payloadHash = String(params[8] ?? '');
-      const envelopeHash = String(params[9] ?? '');
-      const createdAt = Number(params[14] ?? Date.now());
+      const id = String(safeParams[0] ?? '');
+      const senderId = String(safeParams[1] ?? '');
+      const projectId = String(safeParams[2] ?? '');
+      const payloadHash = String(safeParams[8] ?? '');
+      const envelopeHash = String(safeParams[9] ?? '');
+      const createdAt = Number(safeParams[14] ?? Date.now());
       const key = `${projectId}:${senderId}:${id}`;
       this.stagedMessages.set(key, {
         id,
@@ -126,8 +133,8 @@ export class D1TransactionSession implements DatabaseSession {
 
     // Track staged endpoint status
     if (normalized.includes('ENDPOINT_STATUS') && (normalized.startsWith('INSERT INTO') || normalized.startsWith('UPDATE'))) {
-      const endpointId = String(params[0] ?? '');
-      const projectId = String(params[1] ?? '');
+      const endpointId = String(safeParams[0] ?? '');
+      const projectId = String(safeParams[1] ?? '');
       const key = `${projectId}:${endpointId}`;
       const current = this.stagedStatuses.get(key);
       const rev = current ? current.revision + 1 : 2;
@@ -178,19 +185,19 @@ export class D1Adapter implements DatabaseSession {
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const stmt = this.d1.prepare(sql).bind(...sanitizeParams(params));
     const res = await stmt.all<T>();
     return res.results ?? [];
   }
 
   async queryFirst<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | null> {
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const stmt = this.d1.prepare(sql).bind(...sanitizeParams(params));
     const row = await stmt.first<T>();
     return row ?? null;
   }
 
   async execute(sql: string, params: unknown[] = []): Promise<ExecResult> {
-    const stmt = this.d1.prepare(sql).bind(...params);
+    const stmt = this.d1.prepare(sql).bind(...sanitizeParams(params));
     const res = await stmt.run();
     return {
       changes: res.meta?.changes ?? 0,

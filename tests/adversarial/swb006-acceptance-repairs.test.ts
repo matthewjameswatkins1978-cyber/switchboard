@@ -344,6 +344,29 @@ describe('SWB-006 Final Acceptance Repairs Qualification', () => {
     // INVARIANT CHECK: The revoked token MUST STILL BE REJECTED!
     await expect(authService.authenticate(tokenRevoked)).rejects.toThrow(SwitchboardError);
 
+    // DELTA ITEM 1 REGRESSION: Passing a previously used/revoked token as the NEW replacement token must fail
+    await expect(
+      authService.rotateToken(projectId, alice.endpointId, tokenRevoked, {
+        oldToken: newToken2,
+        gracePeriodMs: 60_000,
+      })
+    ).rejects.toThrow(SwitchboardError);
+
+    // INVARIANT CHECK: The revoked token MUST STILL BE REJECTED upon authenticate!
+    await expect(authService.authenticate(tokenRevoked)).rejects.toThrow(SwitchboardError);
+
+    // Passing an existing active token as the NEW replacement token must also fail
+    await expect(
+      authService.rotateToken(projectId, alice.endpointId, tokenActive, {
+        oldToken: newToken2,
+      })
+    ).rejects.toThrow(SwitchboardError);
+
+    // Cannot reissue or reactivate a revoked token via issueToken
+    await expect(
+      authService.issueToken(projectId, alice.endpointId, tokenRevoked)
+    ).rejects.toThrow(SwitchboardError);
+
     // Test with expired token
     const tokenExpired = 'token-already-expired';
     await authService.issueToken(projectId, alice.endpointId, tokenExpired, ['read', 'write'], -5000); // expired 5s ago
@@ -408,6 +431,19 @@ describe('SWB-006 Final Acceptance Repairs Qualification', () => {
 
     // 2. Create backup
     const backup = await service.createScheduledBackup(projectId);
+    expect(backup.storageType).toBe('local_external');
+
+    // Verify listBackups returns local_external
+    const localList = await service.listBackups(admin);
+    expect(localList[0]?.storageType).toBe('local_external');
+
+    // Verify hosted profile explicitly distinguishes hosted_database
+    const hostedService = new SwitchboardService(db, undefined, null);
+    const hostedBackup = await hostedService.createScheduledBackup(projectId);
+    expect(hostedBackup.storageType).toBe('hosted_database');
+    const hostedList = await hostedService.listBackups(admin);
+    const foundHosted = hostedList.find((b) => b.id === hostedBackup.id);
+    expect(foundHosted?.storageType).toBe('hosted_database');
 
     // Verify backup file was written to disk outside database
     const backupFilePath = path.join(testBackupDir, projectId, `${backup.id}.json`);

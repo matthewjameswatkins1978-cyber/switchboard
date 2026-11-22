@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import { SqliteAdapter } from '../../src/db/sqlite-adapter.js';
 import { D1Adapter, type D1DatabaseLike, type D1PreparedStatement } from '../../src/db/d1-adapter.js';
 import { initializeSchema } from '../../src/db/schema.js';
@@ -6,9 +8,11 @@ import { AuthService, sha256 } from '../../src/auth/auth-service.js';
 import { SwitchboardService } from '../../src/core/service.js';
 import { runHousekeeping } from '../../src/operations/housekeeping.js';
 import { BudgetManager } from '../../src/operations/budget.js';
+import { FileBackupStorage } from '../../src/operations/backup-storage.js';
 import type { AuthPrincipal } from '../../src/core/types.js';
 import { SwitchboardError } from '../../src/core/errors.js';
 import { execSync } from 'node:child_process';
+import { unstable_dev } from 'wrangler';
 
 function createD1Mock(): D1DatabaseLike {
   const memAdapter = new SqliteAdapter(':memory:');
@@ -54,6 +58,7 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
   let db: SqliteAdapter;
   let authService: AuthService;
   let service: SwitchboardService;
+  let testBackupDir: string;
   const projectId = 'proj-ops-test';
 
   const alicePrincipal: AuthPrincipal = {
@@ -81,7 +86,9 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
     db = new SqliteAdapter(':memory:');
     await initializeSchema(db);
     authService = new AuthService(db);
-    service = new SwitchboardService(db);
+    testBackupDir = path.join(process.cwd(), '.test-backups-swb004-' + Date.now());
+    const backupStorage = new FileBackupStorage(testBackupDir);
+    service = new SwitchboardService(db, undefined, backupStorage);
 
     await authService.createProject(projectId, 'Ops Test Project');
     await authService.registerEndpoint(projectId, alicePrincipal.endpointId, 'Alice', 'agent');
@@ -91,6 +98,12 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
     await authService.issueToken(projectId, alicePrincipal.endpointId, 'token-alice');
     await authService.issueToken(projectId, bobPrincipal.endpointId, 'token-bob');
     await authService.issueToken(projectId, adminPrincipal.endpointId, 'token-admin', ['admin']);
+  });
+
+  afterEach(async () => {
+    try {
+      await fs.rm(testBackupDir, { recursive: true, force: true });
+    } catch {}
   });
 
   // 1. D1 Batch Sequencing Collision
@@ -542,17 +555,144 @@ describe('SWB-004 Operational Qualification & Terrorbats', () => {
   });
 
   // 9. Real D1 Runtime Tests via Wrangler Local
-  it('validates schema and D1 execution against wrangler local D1 runtime', () => {
-    // Ensure schema is self-contained and applied non-interactively
+  it('validates schema and qualifies multi-client messaging through wrangler local Worker and D1 runtime', async () => {
+    // 1. Ensure schema is self-contained and applied non-interactively
     execSync(
       `npx wrangler d1 execute switchboard-db --local --file=src/db/migrations/0001_initial_schema.sql --yes`,
-      { encoding: 'utf8', stdio: 'pipe' }
+      { encoding: 'utf8', stdio: 'pipe', timeout: 60000 }
     );
 
     const cmd = `npx wrangler d1 execute switchboard-db --local --command="SELECT COUNT(*) as tbl_count FROM sqlite_master WHERE type='table' AND name IN ('messages', 'message_deliveries', 'endpoint_status', 'archived_messages', 'archived_deliveries', 'backups', 'usage_accounting', 'endpoint_sequences')" --yes`;
-    const output = execSync(cmd, { encoding: 'utf8' });
+    const output = execSync(cmd, { encoding: 'utf8', timeout: 60000 });
 
     expect(output).toContain('executed successfully');
     expect(output).toContain('"tbl_count": 8');
-  });
+
+    // 2. Seed test clients into local D1
+    const runSuffix = Date.now();
+    const projId = `proj-worker-live-${runSuffix}`;
+    const epA = `live-a-${runSuffix}`;
+    const epB = `live-b-${runSuffix}`;
+    const tokA = `tok-live-a-${runSuffix}`;
+    const tokB = `tok-live-b-${runSuffix}`;
+    const msg1Id = `msg-live-1-${runSuffix}`;
+    const msg2Id = `msg-live-2-${runSuffix}`;
+
+    const hashA = await sha256(tokA);
+    const hashB = await sha256(tokB);
+    const now = Date.now();
+
+    const seedSql = `
+      INSERT OR IGNORE INTO projects (id, name, created_at) VALUES ('${projId}', 'Worker Live Project', ${now});
+      INSERT OR REPLACE INTO endpoints (id, project_id, name, role, created_at) VALUES ('${epA}', '${projId}', 'Live A', 'agent', ${now});
+      INSERT OR REPLACE INTO endpoints (id, project_id, name, role, created_at) VALUES ('${epB}', '${projId}', 'Live B', 'agent', ${now});
+      INSERT OR REPLACE INTO credentials (token_hash, endpoint_id, project_id, scopes, revoked, created_at) VALUES ('${hashA}', '${epA}', '${projId}', '["read","write"]', 0, ${now});
+      INSERT OR REPLACE INTO credentials (token_hash, endpoint_id, project_id, scopes, revoked, created_at) VALUES ('${hashB}', '${epB}', '${projId}', '["read","write"]', 0, ${now});
+    `;
+    execSync(
+      `npx wrangler d1 execute switchboard-db --local --command="${seedSql.replace(/\n/g, ' ')}" --yes`,
+      { encoding: 'utf8', stdio: 'pipe', timeout: 60000 }
+    );
+
+    // 3. Launch actual Worker via unstable_dev against local D1
+    const worker = await unstable_dev('src/server/worker.ts', {
+      config: 'wrangler.toml',
+      experimental: { disableExperimentalWarning: true },
+    });
+
+    try {
+      // 4. Client A sends message to Client B via Worker HTTP
+      const sendRes = await worker.fetch('/api/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokA}`,
+        },
+        body: JSON.stringify({
+          id: msg1Id,
+          recipientType: 'endpoint',
+          recipientId: epB,
+          kind: 'task.v1',
+          subject: 'Task dispatch to B',
+          payload: { action: 'compute', factor: 42 },
+        }),
+      });
+      expect(sendRes.status).toBe(201);
+      const sendJson: any = await sendRes.json();
+      expect(sendJson.messageId).toBe(msg1Id);
+      expect(sendJson.status).toBe('STORED');
+
+      // 5. Client B fetches inbox via Worker HTTP
+      const inboxRes = await worker.fetch('/api/v1/inbox', {
+        headers: {
+          Authorization: `Bearer ${tokB}`,
+        },
+      });
+      expect(inboxRes.status).toBe(200);
+      const inboxJson: any = await inboxRes.json();
+      expect(inboxJson.deliveries).toBeDefined();
+      const deliv = inboxJson.deliveries.find((d: any) => d.id === msg1Id);
+      expect(deliv).toBeDefined();
+      expect(deliv.subject).toBe('Task dispatch to B');
+      expect(deliv.deliverySequence).toBeGreaterThan(0);
+
+      // 6. Client B acknowledges message via Worker HTTP
+      const ackRes = await worker.fetch('/api/v1/acknowledgements', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokB}`,
+        },
+        body: JSON.stringify([
+          { messageId: msg1Id, senderId: epA },
+        ]),
+      });
+      expect(ackRes.status).toBe(200);
+      const ackJson: any = await ackRes.json();
+      expect(ackJson.receipts).toHaveLength(1);
+      expect(ackJson.receipts[0].status).toBe('ACKNOWLEDGED');
+
+      // 7. Client B sends reply back to Client A via Worker HTTP
+      const replyRes = await worker.fetch('/api/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokB}`,
+        },
+        body: JSON.stringify({
+          id: msg2Id,
+          recipientType: 'endpoint',
+          recipientId: epA,
+          kind: 'task.reply.v1',
+          subject: 'Re: Task dispatch to B',
+          payload: { result: 'complete' },
+          replyToId: msg1Id,
+        }),
+      });
+      expect(replyRes.status).toBe(201);
+
+      // 8. Client A synchronizes (sync) via Worker HTTP, receiving reply and acknowledging it
+      const syncRes = await worker.fetch('/api/v1/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokA}`,
+        },
+        body: JSON.stringify({
+          inboxCursor: 0,
+          acknowledgements: [{ messageId: msg2Id, senderId: epB }],
+        }),
+      });
+      expect(syncRes.status).toBe(200);
+      const syncJson: any = await syncRes.json();
+      expect(syncJson.inboundMessages).toBeDefined();
+      const inboundReply = syncJson.inboundMessages.find((m: any) => m.id === msg2Id);
+      expect(inboundReply).toBeDefined();
+      expect(inboundReply.replyToId).toBe(msg1Id);
+      expect(syncJson.acknowledgedReceipts).toBeDefined();
+      expect(syncJson.acknowledgedReceipts[0].status).toBe('ACKNOWLEDGED');
+    } finally {
+      await worker.stop();
+    }
+  }, 90_000);
 });

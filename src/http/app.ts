@@ -214,7 +214,11 @@ export function createSwitchboardApp(deps: AppDependencies) {
   app.post('/api/v1/acknowledgements', async (c) => {
     const principal = await requirePrincipal(c);
     const body = await c.req.json();
-    const acks = Array.isArray(body) ? body : [body];
+    const acks = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.acknowledgements)
+        ? body.acknowledgements
+        : [body];
     const receipts = await svc.acknowledge(principal, acks);
     return c.json({ receipts });
   });
