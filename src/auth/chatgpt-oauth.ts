@@ -69,7 +69,14 @@ export async function routeChatGptOAuth(
     requiredScopes: [scope],
     scopesSupported: [scope],
     clientIdMetadataDocumentEnabled: false,
-    onError: () => undefined,
+    onError({ code, status, internal }) {
+      if (url.pathname === routes.token) {
+        console.warn(JSON.stringify({
+          event: 'switchboard.oauth.token_error',
+          status, code, category: internal.category, reason: internal.reason,
+        }));
+      }
+    },
     authorizeEndpoint: routes.authorize,
     tokenEndpoint: routes.token,
     clientRegistrationEndpoint: routes.register,
@@ -85,6 +92,14 @@ export async function routeChatGptOAuth(
     tokenExchangeCallback(options) {
       if (!hasApproval(options.props) || options.userId !== endpointId ||
           options.resource !== resource || !validScopes(options.requestedScope)) {
+        console.warn(JSON.stringify({
+          event: 'switchboard.oauth.token_policy_rejected',
+          grantType: options.grantType,
+          ownerApproval: !!hasApproval(options.props),
+          identity: options.userId === endpointId,
+          audience: options.resource === resource,
+          scope: validScopes(options.requestedScope),
+        }));
         throw new OAuthError('invalid_grant', { description: 'Grant is no longer authorized' });
       }
     },
