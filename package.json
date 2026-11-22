@@ -13,10 +13,16 @@
     "./client": {
       "types": "./dist/client/switchboard-client.d.ts",
       "import": "./dist/client/switchboard-client.js"
+    },
+    "./plug": {
+      "types": "./dist/plug/switchboard-plug.d.ts",
+      "import": "./dist/plug/switchboard-plug.js"
     }
   },
   "bin": {
-    "switchboard": "./dist/server/node-server.js"
+    "switchboard": "./dist/server/node-server.js",
+    "sb": "./bin/sb.js",
+    "sb-mcp": "./bin/sb-mcp.js"
   },
   "scripts": {
     "build": "tsc",

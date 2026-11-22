@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import type {
   OutgoingMessageInput,
   AckInput,
@@ -6,6 +8,11 @@ import type {
   SyncResponse,
   MessageEnvelope,
   StoredReceipt,
+  AckReceipt,
+  EndpointStatusRecord,
+  BoardSummary,
+  Priority,
+  RecipientType,
 } from '../core/types.js';
 import { calculateExponentialBackoffWithJitter, DEFAULT_TIMINGS } from '../core/timings.js';
 
@@ -15,6 +22,8 @@ export interface ClientPersistedState {
   inbox: MessageEnvelope[];
   cursor?: string;
   status?: StatusUpdateInput;
+  readMessageIds?: string[];
+  acknowledgedMessageIds?: string[];
 }
 
 export interface ClientStorage {
@@ -55,6 +64,10 @@ export class FileClientStorage implements ClientStorage {
 
   save(state: ClientPersistedState): void {
     try {
+      const dir = path.dirname(this.filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       const json = JSON.stringify(state, null, 2);
       fs.writeFileSync(this.filePath, json, 'utf8');
     } catch (err) {
@@ -103,6 +116,8 @@ export class SwitchboardClient {
   private currentStatus?: StatusUpdateInput;
   private cursor?: string;
   private inbox: MessageEnvelope[] = [];
+  private readMessageIds = new Set<string>();
+  private acknowledgedMessageIds = new Set<string>();
   private inFlightSync: Promise<SyncResponse> | null = null;
   private consecutiveFailures = 0;
   private lastError?: string;
@@ -129,12 +144,25 @@ export class SwitchboardClient {
     }
   }
 
+  public reload(): void {
+    const saved = this.storage.load();
+    if (saved && typeof (saved as any).then === 'function') {
+      (saved as Promise<ClientPersistedState | null>).then((loaded) => {
+        if (loaded) this.applyLoadedState(loaded);
+      });
+    } else if (saved) {
+      this.applyLoadedState(saved as ClientPersistedState);
+    }
+  }
+
   private applyLoadedState(state: ClientPersistedState) {
     if (Array.isArray(state.outbox)) this.outbox = [...state.outbox];
     if (Array.isArray(state.pendingAcks)) this.pendingAcks = [...state.pendingAcks];
     if (Array.isArray(state.inbox)) this.inbox = [...state.inbox];
     if (state.cursor !== undefined) this.cursor = state.cursor;
     if (state.status !== undefined) this.currentStatus = state.status;
+    if (Array.isArray(state.readMessageIds)) this.readMessageIds = new Set(state.readMessageIds);
+    if (Array.isArray(state.acknowledgedMessageIds)) this.acknowledgedMessageIds = new Set(state.acknowledgedMessageIds);
   }
 
   private async persistState(): Promise<void> {
@@ -144,6 +172,8 @@ export class SwitchboardClient {
       inbox: [...this.inbox],
       cursor: this.cursor,
       status: this.currentStatus,
+      readMessageIds: Array.from(this.readMessageIds),
+      acknowledgedMessageIds: Array.from(this.acknowledgedMessageIds),
     };
     await this.storage.save(snapshot);
   }
@@ -213,6 +243,290 @@ export class SwitchboardClient {
       this.awaitingResponseStartMs = undefined;
     }
     this.persistState();
+  }
+
+  /**
+   * Helper to generate a unique client idempotency message ID
+   */
+  generateMessageId(prefix: string = 'msg'): string {
+    const timestamp = Date.now();
+    const rand = crypto.randomBytes(4).toString('hex');
+    return `${prefix}-${this.endpointId}-${timestamp}-${rand}`;
+  }
+
+  /**
+   * Mark a local inbox message as read
+   */
+  markRead(messageId: string): void {
+    this.readMessageIds.add(messageId);
+    this.persistState();
+  }
+
+  /**
+   * Check if a message has been read
+   */
+  isRead(messageId: string): boolean {
+    return this.readMessageIds.has(messageId);
+  }
+
+  /**
+   * Check if a message has been acknowledged
+   */
+  isAcknowledged(senderId: string, messageId: string): boolean {
+    return this.acknowledgedMessageIds.has(`${senderId}:${messageId}`);
+  }
+
+  /**
+   * Get unread messages from local inbox
+   */
+  getUnreadInbox(): MessageEnvelope[] {
+    return this.inbox.filter((m) => !this.readMessageIds.has(m.id));
+  }
+
+  /**
+   * Get a specific message from local inbox
+   */
+  getMessage(messageId: string): MessageEnvelope | undefined {
+    return this.inbox.find((m) => m.id === messageId);
+  }
+
+  /**
+   * Construct an addressed message input with auto-generated idempotency ID
+   */
+  createMessage(params: {
+    recipientType?: RecipientType;
+    recipientId: string;
+    kind?: string;
+    subject: string;
+    payload: unknown;
+    priority?: Priority;
+    threadId?: string | null;
+    replyToId?: string | null;
+    evidenceRefs?: string[] | null;
+    id?: string;
+  }): OutgoingMessageInput {
+    const msg: OutgoingMessageInput = {
+      id: params.id ?? this.generateMessageId('msg'),
+      recipientType: params.recipientType ?? 'endpoint',
+      recipientId: params.recipientId,
+      kind: params.kind ?? 'message.v1',
+      subject: params.subject,
+      payload: params.payload,
+      priority: params.priority ?? 'normal',
+    };
+    if (params.threadId) msg.threadId = params.threadId;
+    if (params.replyToId) msg.replyToId = params.replyToId;
+    if (params.evidenceRefs && params.evidenceRefs.length > 0) {
+      msg.evidenceRefs = params.evidenceRefs;
+    }
+    return msg;
+  }
+
+  /**
+   * Construct a correlated reply to a received message
+   */
+  createReply(
+    originalMessageId: string,
+    reply: {
+      subject?: string;
+      payload: unknown;
+      kind?: string;
+      priority?: Priority;
+      evidenceRefs?: string[] | null;
+      id?: string;
+    }
+  ): OutgoingMessageInput {
+    const original = this.getMessage(originalMessageId);
+    const recipientId = original ? original.senderId : 'unknown';
+    const threadId = original?.threadId ?? (original ? original.id : originalMessageId);
+    const subject =
+      reply.subject ??
+      (original?.subject?.startsWith('Re: ')
+        ? original.subject
+        : `Re: ${original?.subject ?? originalMessageId}`);
+    const kind = reply.kind ?? original?.kind ?? 'reply.v1';
+
+    const msg: OutgoingMessageInput = {
+      id: reply.id ?? this.generateMessageId('rep'),
+      recipientType: 'endpoint',
+      recipientId,
+      kind,
+      subject,
+      payload: reply.payload,
+      priority: reply.priority ?? original?.priority ?? 'normal',
+      threadId,
+      replyToId: originalMessageId,
+    };
+    if (reply.evidenceRefs && reply.evidenceRefs.length > 0) {
+      msg.evidenceRefs = reply.evidenceRefs;
+    }
+    return msg;
+  }
+
+  /**
+   * Enqueue a correlated reply
+   */
+  queueReply(
+    originalMessageId: string,
+    reply: {
+      subject?: string;
+      payload: unknown;
+      kind?: string;
+      priority?: Priority;
+      evidenceRefs?: string[] | null;
+      id?: string;
+    }
+  ): OutgoingMessageInput {
+    const msg = this.createReply(originalMessageId, reply);
+    this.queueMessage(msg);
+    return msg;
+  }
+
+  /**
+   * Acknowledge a message (queues ack and records local acknowledged state)
+   */
+  acknowledgeMessage(messageId: string, senderId: string, note?: string): void {
+    this.queueAck({ messageId, senderId, note });
+    this.acknowledgedMessageIds.add(`${senderId}:${messageId}`);
+    this.markRead(messageId);
+  }
+
+  /**
+   * Statistics snapshot of the local client state
+   */
+  getStats() {
+    return {
+      endpointId: this.endpointId,
+      outboxCount: this.outbox.length,
+      inboxCount: this.inbox.length,
+      unreadCount: this.getUnreadInbox().length,
+      pendingAckCount: this.pendingAcks.length,
+      consecutiveFailures: this.consecutiveFailures,
+      lastError: this.lastError,
+      cursor: this.cursor,
+    };
+  }
+
+  /**
+   * Clear acknowledged messages from local inbox
+   */
+  clearAcknowledgedInbox(): void {
+    this.inbox = this.inbox.filter((m) => !this.acknowledgedMessageIds.has(`${m.senderId}:${m.id}`));
+    this.persistState();
+  }
+
+  /**
+   * Fetch unacknowledged messages directly via GET /api/v1/inbox
+   */
+  async getInboxDirect(options?: { limit?: number; offset?: number }): Promise<MessageEnvelope[]> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set('limit', String(options.limit));
+    if (options?.offset) params.set('offset', String(options.offset));
+    const qs = params.toString() ? `?${params.toString()}` : '';
+
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/inbox${qs}`, { method: 'GET' });
+    return (await res.json()) as MessageEnvelope[];
+  }
+
+  /**
+   * Send explicit acknowledgements directly via POST /api/v1/acknowledgements
+   */
+  async acknowledgeDirect(acks: AckInput | AckInput[]): Promise<AckReceipt[]> {
+    const payload = Array.isArray(acks) ? acks : [acks];
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/acknowledgements`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json();
+    return (json as any).receipts as AckReceipt[];
+  }
+
+  /**
+   * Fetch a single message directly via GET /api/v1/messages/:id
+   */
+  async getMessageDirect(messageId: string, senderId?: string): Promise<MessageEnvelope> {
+    const qs = senderId ? `?senderId=${encodeURIComponent(senderId)}` : '';
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/messages/${encodeURIComponent(messageId)}${qs}`, {
+      method: 'GET',
+    });
+    return (await res.json()) as MessageEnvelope;
+  }
+
+  /**
+   * Fetch thread messages directly via GET /api/v1/threads/:id
+   */
+  async getThreadDirect(threadId: string, limit?: number): Promise<{ threadId: string; messages: MessageEnvelope[] }> {
+    const qs = limit ? `?limit=${limit}` : '';
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/threads/${encodeURIComponent(threadId)}${qs}`, {
+      method: 'GET',
+    });
+    return (await res.json()) as { threadId: string; messages: MessageEnvelope[] };
+  }
+
+  /**
+   * List endpoints in project directly via GET /api/v1/endpoints
+   */
+  async listEndpointsDirect(): Promise<EndpointStatusRecord[]> {
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/endpoints`, { method: 'GET' });
+    const json = await res.json();
+    return (json as any).endpoints as EndpointStatusRecord[];
+  }
+
+  /**
+   * Get endpoint status directly via GET /api/v1/endpoints/:id/status
+   */
+  async getStatusDirect(endpointId: string): Promise<EndpointStatusRecord> {
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/endpoints/${encodeURIComponent(endpointId)}/status`, {
+      method: 'GET',
+    });
+    return (await res.json()) as EndpointStatusRecord;
+  }
+
+  /**
+   * Update status directly via PUT /api/v1/status
+   */
+  async updateStatusDirect(status: StatusUpdateInput): Promise<EndpointStatusRecord> {
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/status`, {
+      method: 'PUT',
+      body: JSON.stringify(status),
+    });
+    return (await res.json()) as EndpointStatusRecord;
+  }
+
+  /**
+   * Get coordination board summary directly via GET /api/v1/board
+   */
+  async getBoardDirect(): Promise<BoardSummary> {
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v1/board`, { method: 'GET' });
+    return (await res.json()) as BoardSummary;
+  }
+
+  private async fetchWithAuth(url: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const headers = new Headers(init.headers);
+      headers.set('Authorization', `Bearer ${this.token}`);
+      if (init.body && !headers.has('Content-Type')) {
+        headers.set('Content-Type', 'application/json');
+      }
+
+      const res = await this.fetchFn(url, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as any)?.error?.message ?? `Request failed: HTTP ${res.status}`);
+      }
+
+      return res;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -321,6 +635,9 @@ export class SwitchboardClient {
       this.pendingAcks = this.pendingAcks.filter(
         (ack) => !ackedIds.has(`${ack.senderId}:${ack.messageId}`)
       );
+      for (const ack of syncRes.acknowledgedReceipts) {
+        this.acknowledgedMessageIds.add(`${ack.senderId}:${ack.messageId}`);
+      }
 
       // If status update succeeded, clear local intended update
       if (statusToSend && !syncRes.errors.some((e) => e.code === 'CONFLICT')) {

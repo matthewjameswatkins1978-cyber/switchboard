@@ -13,3 +13,7 @@ coverage/
 *.jsonl
 backups/
 .test-backups*/
+.switchboard/
+*.local.json
+credentials*.json
+state*.json
