@@ -6,8 +6,8 @@ Use `npm ci` and `npm run build` from the reviewed commit. Keep the Work Board a
 | --- | --- |
 | ChatGPT and Work | Follow [the OAuth setup](SWB-006-CHATGPT.md). Connect using the approved endpoint and correlate a native inbox invocation with a sanitized Worker receipt in each host. |
 | Codex | Follow [the durable stdio plug setup](CODEX-PLUG.md). Reuse the configured mailbox and endpoint identity. Run `status` and `sync` from the host and verify a stored receipt with a designated test peer. |
-| Pi | Use the harness setup in [the README](README.md) and the Pi integration owner's qualified configuration. Confirm native send, receipt and recovery across a Pi restart before accepting the rollout. |
-| Antigravity | Use the harness setup in [the README](README.md) with its own endpoint and durable mailbox. Confirm native send and receipt with a designated test peer. |
+| Pi | Use the harness setup in [the operations guide](OPERATIONS.md) and the Pi integration owner's qualified configuration. Confirm native send, receipt and recovery across a Pi restart before accepting the rollout. |
+| Antigravity | Use the harness setup in [the operations guide](OPERATIONS.md) with its own endpoint and durable mailbox. Confirm native send and receipt with a designated test peer. |
 
 ## Rollback
 
