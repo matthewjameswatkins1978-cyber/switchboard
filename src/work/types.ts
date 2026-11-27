@@ -1,0 +1,173 @@
+import type { EndpointRole, Priority } from '../core/types.js';
+
+/**
+ * SWB-SWEEP-001 work semantics.
+ *
+ * This layer is deliberately narrow. It records who owns an obligation and what
+ * happened to it. It never claims that an external process started, stopped or
+ * finished, and it never infers completion from presence, age or delivery state.
+ */
+
+export type WorkState =
+  | 'UNCLAIMED'
+  | 'CLAIMED'
+  | 'IN_PROGRESS'
+  | 'WAITING'
+  | 'BLOCKED'
+  | 'SUBMITTED'
+  | 'REVIEW'
+  | 'RESOLVED';
+
+/**
+ * Terminal reasons stay distinguishable for the whole life of the record so an
+ * auditor can tell "finished" from "no longer wanted" from "replaced by X".
+ */
+export type WorkResolutionReason =
+  | 'COMPLETED'
+  | 'SUPERSEDED'
+  | 'OBSOLETE'
+  | 'CANCELLED'
+  | 'DUPLICATE';
+
+export type WorkEventType =
+  | 'COMMISSIONED'
+  | 'CLAIMED'
+  | 'STATE_CHANGED'
+  | 'STOP_REQUESTED'
+  | 'STOP_HANDOFF_RECORDED'
+  | 'RELEASE_PROPOSED'
+  | 'RESOLVED'
+  | 'REOPENED'
+  | 'ARCHIVED'
+  | 'HANDOFF_TRANSFERRED';
+
+export interface WorkItem {
+  projectId: string;
+  id: string;
+  state: WorkState;
+  resolutionReason: WorkResolutionReason | null;
+  priority: Priority;
+  objective: string;
+  scopeRefs: string[];
+  acceptanceCriteria: string[];
+  evidenceRefs: string[];
+  dependsOn: string[];
+  commissionerId: string;
+  commissionerRole: EndpointRole;
+  executorId: string | null;
+  claimedAt: number | null;
+  submittedAt: number | null;
+  resolvedAt: number | null;
+  resolvedBy: string | null;
+  threadId: string | null;
+  sourceMessageId: string | null;
+  replacesWorkId: string | null;
+  supersededByWorkId: string | null;
+  stopRequestedAt: number | null;
+  stopRequestedBy: string | null;
+  stopReason: string | null;
+  stopHandoffAt: number | null;
+  reconciliationDeferred: boolean;
+  archivedAt: number | null;
+  revision: number;
+  lastEventSeq: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface WorkEvent {
+  projectId: string;
+  workId: string;
+  seq: number;
+  eventType: WorkEventType;
+  fromState: WorkState | null;
+  toState: WorkState;
+  actorId: string;
+  actorRole: EndpointRole;
+  reason: string | null;
+  note: string | null;
+  evidenceRefs: string[];
+  operationId: string;
+  expectedRevision: number | null;
+  resultingRevision: number;
+  createdAt: number;
+}
+
+/** A durable, replay-safe receipt for one accepted work operation. */
+export interface WorkReceipt {
+  operationId: string;
+  workId: string;
+  eventSeq: number;
+  eventType: WorkEventType;
+  state: WorkState;
+  resolutionReason: WorkResolutionReason | null;
+  revision: number;
+  actorId: string;
+  at: number;
+  isReplay: boolean;
+}
+
+/** Concise candidate shown to a commissioner. Deliberately small. */
+export interface WorkCandidate {
+  workId: string;
+  state: WorkState;
+  priority: Priority;
+  objective: string;
+  revision: number;
+  updatedAt: number;
+  matchReasons: string[];
+  resolutionReason?: WorkResolutionReason | null;
+  supersededByWorkId?: string | null;
+  evidenceRefs?: string[];
+}
+
+export interface CommissionWorkResult {
+  work: WorkItem;
+  receipt: WorkReceipt;
+  /** Bounded related outstanding work the commissioner has authority over. */
+  relatedCandidates: WorkCandidate[];
+  relatedCandidateCount: number;
+  /** True when this commission did not reconcile the related candidates. */
+  reconciliationDeferred: boolean;
+}
+
+export interface RelatedWorkResult {
+  candidates: WorkCandidate[];
+  outstandingCount: number;
+}
+
+export interface WorkListResult {
+  items: WorkCandidate[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export interface WorkDetail {
+  work: WorkItem;
+  events: WorkEvent[];
+  historyTruncated: boolean;
+}
+
+export interface WorkBoard {
+  projectId: string;
+  serverTime: number;
+  limits: { perSection: number };
+  counts: {
+    unclaimed: number;
+    active: number;
+    waitingOrBlocked: number;
+    submittedOrReview: number;
+    stopRequests: number;
+    reconciliationCandidates: number;
+    resolved: number;
+    archived: number;
+  };
+  unclaimed: WorkCandidate[];
+  active: WorkCandidate[];
+  waitingOrBlocked: WorkCandidate[];
+  submittedOrReview: WorkCandidate[];
+  stopRequests: WorkCandidate[];
+  reconciliationCandidates: WorkCandidate[];
+  /** Transport state stays separate from work state. */
+  deliveries: { unacknowledged: number; deadLettered: number };
+}

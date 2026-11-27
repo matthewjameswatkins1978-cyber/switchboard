@@ -4,6 +4,8 @@ import type { SwitchboardService } from '../core/service.js';
 import type { AuthPrincipal } from '../core/types.js';
 import { AuthService } from '../auth/auth-service.js';
 import { BudgetManager } from '../operations/budget.js';
+import { WorkService } from '../work/work-service.js';
+import { registerWorkTools } from '../work/mcp-tools.js';
 
 export function createSwitchboardMcpServer(
   service: SwitchboardService,
@@ -298,6 +300,9 @@ export function createSwitchboardMcpServer(
       };
     }
   );
+
+  // Work-lifecycle coordination (SWB-SWEEP-001). Additive: messaging tools are unchanged.
+  registerWorkTools(server, new WorkService(service.database), principal);
 
   return server;
 }

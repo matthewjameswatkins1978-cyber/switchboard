@@ -15,6 +15,7 @@ import type { AuthPrincipal } from '../core/types.js';
 import { acceptsProtocol, PROTOCOL_HEADER, PROTOCOL_INFO } from '../operations/control.js';
 import { runHousekeeping } from '../operations/housekeeping.js';
 import { BudgetManager } from '../operations/budget.js';
+import { WorkService } from '../work/work-service.js';
 
 export interface AppDependencies {
   authService: AuthService;
@@ -30,6 +31,7 @@ export function createSwitchboardApp(deps: AppDependencies) {
   const auth = deps.authService;
   const svc = deps.service;
   const db = svc.database;
+  const work = new WorkService(db);
   const metrics = deps.metrics ?? MetricsCollector.getInstance();
   const rateLimitMax = deps.rateLimitMaxPerMinute ?? 600; // 600 req/min default
 
@@ -263,6 +265,67 @@ export function createSwitchboardApp(deps: AppDependencies) {
     const principal = await requirePrincipal(c);
     const board = await svc.getBoard(principal);
     return c.json(board);
+  });
+
+  // Work lifecycle (SWB-SWEEP-001). Additive: existing messaging routes are unchanged.
+  app.get('/api/v1/work', async (c) => {
+    const principal = await requirePrincipal(c);
+    const limitParam = c.req.query('limit');
+    return c.json(
+      await work.list(principal, {
+        state: c.req.query('state') || undefined,
+        includeArchived: c.req.query('includeArchived') === 'true',
+        limit: limitParam ? Number(limitParam) : undefined,
+        cursor: c.req.query('cursor') || undefined,
+      })
+    );
+  });
+
+  app.post('/api/v1/work', async (c) => {
+    const principal = await requirePrincipal(c);
+    return c.json(await work.commission(principal, await c.req.json()), 201);
+  });
+
+  app.get('/api/v1/work-board', async (c) => {
+    const principal = await requirePrincipal(c);
+    return c.json(await work.board(principal));
+  });
+
+  app.post('/api/v1/work/related', async (c) => {
+    const principal = await requirePrincipal(c);
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await work.relatedWork(principal, body));
+  });
+
+  app.get('/api/v1/work/:id', async (c) => {
+    const principal = await requirePrincipal(c);
+    return c.json(await work.get(principal, c.req.param('id')));
+  });
+
+  const workActions: Record<
+    string,
+    (principal: AuthPrincipal, body: Record<string, unknown>, workId: string) => Promise<unknown>
+  > = {
+    claim: (principal, body, workId) => work.claim(principal, { ...body, workId }),
+    transitions: (principal, body, workId) => work.transition(principal, { ...body, workId }),
+    resolve: (principal, body, workId) => work.resolve(principal, { ...body, workId }),
+    supersede: (principal, body, workId) => work.supersede(principal, { ...body, workId }),
+    stop: (principal, body, workId) => work.requestStop(principal, { ...body, workId }),
+    'stop-handoff': (principal, body, workId) => work.recordStopHandoff(principal, { ...body, workId }),
+    transfer: (principal, body, workId) => work.transfer(principal, { ...body, workId }),
+    'release-proposal': (principal, body, workId) => work.proposeRelease(principal, { ...body, workId }),
+    reopen: (principal, body, workId) => work.reopen(principal, { ...body, workId }),
+    archive: (principal, body, workId) => work.archive(principal, { ...body, workId }),
+  };
+
+  app.post('/api/v1/work/:id/:action', async (c) => {
+    const principal = await requirePrincipal(c);
+    const action = workActions[c.req.param('action')];
+    if (!action) {
+      throw new SwitchboardError('NOT_FOUND', `Unknown work action '${c.req.param('action')}'`);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await action(principal, body, c.req.param('id')));
   });
 
   app.post('/api/v1/export', async (c) => {

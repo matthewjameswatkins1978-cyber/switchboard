@@ -13,3 +13,4 @@ export * from './http/app.js';
 export * from './mcp/mcp-server.js';
 export * from './mcp/mcp-web-handler.js';
 export * from './client/switchboard-client.js';
+export * from './work/index.js';

@@ -110,6 +110,7 @@ The [engineering specification](SPEC.md) describes the protocol, operational con
 - **Better operational visibility:** make delivery backlogs, health and resource usage easier to inspect without collecting private message contents.
 - **Oracle compatibility:** the provisional, optional telemetry boundary will let a future Oracle plug consume bounded operational observations. Oracle is a separate project, not a dependency of Switchboard.
 - **Additional clients:** welcome adapters for other AI environments and ordinary programs without changing the core messaging contract.
+- **Work coordination (Sweep):** an optional, model-free work lifecycle and reconciliation layer over the same durable messaging is described in [SWEEP.md](SWEEP.md). Delivery state stays independent of work state, and nothing there is required for ordinary messaging.
 
 These are directions, not promises that every feature is already implemented or belongs in the core. We intend to keep Switchboard small and dependable. It should be useful to people whose workflow looks nothing like ours.
 
