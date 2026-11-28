@@ -111,6 +111,12 @@ are repaired on this branch, with regression tests in
   snapshotted at commit time (`resulting_resolution_reason`), so history
   stays stable across later reopening, transfer or re-resolution.
   Internally derived ids (`<op>:supersede`) are hash-bound the same way.
+  Events committed before migration 0003 carry NULL in the new columns;
+  their receipts report a NULL reason rather than borrowing the work's
+  current reason, so pre-migration history is never misattributed.
+  `stopHandoffAt`, once recorded, is never cleared or nulled by any later
+  operation: the C1 gate depends on it permanently distinguishing
+  "stopped and handed off" from "stopped and still owned".
 - **C3 (commissioner succession):** `transferCommissionership` moves the
   commissioner's responsibility explicitly (commissioner or steward only,
   target must exist, revision-guarded, receipted). A departing model no
