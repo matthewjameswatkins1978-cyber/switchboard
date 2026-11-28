@@ -73,6 +73,13 @@ interface WorkRow {
   stop_requested_by: string | null;
   stop_reason: string | null;
   stop_handoff_at: number | null;
+  exec_episode: number;
+  stop_seq: number;
+  stop_open: number;
+  handoff_episode: number | null;
+  handoff_stop_seq: number | null;
+  handoff_by: string | null;
+  exec_started_episode: number | null;
   reconciliation_deferred: number;
   archived_at: number | null;
   revision: number;
@@ -105,7 +112,9 @@ const WORK_COLUMNS = `project_id, id, state, resolution_reason, priority, object
   acceptance_criteria, evidence_refs, depends_on, commissioner_id, commissioner_role, executor_id,
   claimed_at, submitted_at, resolved_at, resolved_by, thread_id, source_message_id,
   replaces_work_id, superseded_by_work_id, stop_requested_at, stop_requested_by, stop_reason,
-  stop_handoff_at, reconciliation_deferred, archived_at, revision, last_event_seq, created_at, updated_at`;
+  stop_handoff_at, exec_episode, stop_seq, stop_open, handoff_episode, handoff_stop_seq,
+  handoff_by, exec_started_episode, reconciliation_deferred, archived_at, revision,
+  last_event_seq, created_at, updated_at`;
 
 const EVENT_COLUMNS = `project_id, work_id, seq, event_type, from_state, to_state, actor_id,
   actor_role, reason, note, evidence_refs, operation_id, expected_revision, resulting_revision,
@@ -167,6 +176,13 @@ function mapWork(row: WorkRow): WorkItem {
     stopRequestedBy: row.stop_requested_by ?? null,
     stopReason: row.stop_reason ?? null,
     stopHandoffAt: row.stop_handoff_at ?? null,
+    execEpisode: Number(row.exec_episode ?? 0),
+    stopSeq: Number(row.stop_seq ?? 0),
+    stopOpen: Number(row.stop_open ?? 0) === 1,
+    handoffEpisode: row.handoff_episode ?? null,
+    handoffStopSeq: row.handoff_stop_seq ?? null,
+    handoffBy: row.handoff_by ?? null,
+    execStartedEpisode: row.exec_started_episode ?? null,
     reconciliationDeferred: Number(row.reconciliation_deferred) === 1,
     archivedAt: row.archived_at ?? null,
     revision: Number(row.revision),
@@ -219,6 +235,41 @@ function sortKeys(value: unknown): unknown {
     return Object.fromEntries(entries);
   }
   return value;
+}
+
+/**
+ * C1 episode gate (Lucy-directed). A handoff satisfies the gate only when it
+ * is bound to the CURRENT execution episode, the CURRENT stop request and
+ * the CURRENT executor. History is preserved in work_events; only these
+ * live markers decide.
+ */
+function handoffSatisfied(work: WorkItem): boolean {
+  return (
+    work.handoffEpisode !== null &&
+    work.handoffEpisode === work.execEpisode &&
+    work.handoffStopSeq !== null &&
+    work.handoffStopSeq === work.stopSeq &&
+    work.handoffBy !== null &&
+    work.executorId !== null &&
+    work.handoffBy === work.executorId
+  );
+}
+
+/**
+ * Active ownership with a potentially executing assignment: an executor is
+ * (or was, in this episode) attached and the work is live. Truly unclaimed
+ * work and verified no-start work (claimed but never entered IN_PROGRESS
+ * in this episode, never stopped) are NOT gated: there is no partial
+ * execution to abandon.
+ */
+function needsHandoffGate(work: WorkItem): boolean {
+  if (work.executorId === null || work.state === 'UNCLAIMED' || work.state === 'RESOLVED') {
+    return false;
+  }
+  const startedInEpisode =
+    work.execStartedEpisode !== null && work.execStartedEpisode === work.execEpisode;
+  const stoppedInHistory = work.stopSeq > 0 || work.stopOpen;
+  return startedInEpisode || stoppedInHistory;
 }
 
 function candidateFrom(work: WorkItem, matchReasons: string[] = []): WorkCandidate {
@@ -660,6 +711,13 @@ export class WorkService {
     operationHash: string;
     sets: Array<{ sql: string; params: unknown[] }>;
     guard: { sql: string; params: unknown[] };
+    /**
+     * When true, the guarded mutation additionally requires the current
+     * episode-bound handoff for active ownership. Evaluated here for a clean
+     * error AND inside the guarded SQL so concurrent handoff/transfer races
+     * resolve explicitly instead of silently overwriting.
+     */
+    enforceHandoff?: boolean;
   }): Promise<WorkReceipt> {
     const { principal, work } = params;
     const now = Date.now();
@@ -667,6 +725,27 @@ export class WorkService {
     const resultingRevision = params.expectedRevision + 1;
     const extraSetSql = params.sets.map((set) => `, ${set.sql}`).join('');
     const extraSetParams = params.sets.flatMap((set) => set.params);
+    const gated = params.enforceHandoff === true && needsHandoffGate(work);
+    if (gated && !handoffSatisfied(work)) {
+      throw new SwitchboardError(
+        'CONFLICT',
+        `Work '${work.id}' needs a current safe handoff before this disposition: record a stop handoff bound to episode ${work.execEpisode} first`,
+        {
+          details: {
+            workId: work.id,
+            execEpisode: work.execEpisode,
+            stopSeq: work.stopSeq,
+            stopOpen: work.stopOpen,
+          },
+        }
+      );
+    }
+    let guardSql = params.guard.sql;
+    let guardParams = [...params.guard.params];
+    if (gated) {
+      guardSql += ` AND handoff_episode = ? AND handoff_stop_seq = ? AND handoff_by = ?`;
+      guardParams.push(work.execEpisode, work.stopSeq, work.executorId);
+    }
 
     await this.db.transaction(async (tx) => {
       await tx.execute(
@@ -678,7 +757,7 @@ export class WorkService {
          WHERE EXISTS (
            SELECT 1 FROM work_items
            WHERE project_id = ? AND id = ? AND revision = ? AND last_event_seq = ?
-           ${params.guard.sql}
+           ${guardSql}
          )`,
         [
           principal.projectId,
@@ -702,7 +781,7 @@ export class WorkService {
           work.id,
           params.expectedRevision,
           work.lastEventSeq,
-          ...params.guard.params,
+          ...guardParams,
         ]
       );
 
@@ -711,7 +790,7 @@ export class WorkService {
            SET state = ?, resolution_reason = ?, revision = revision + 1,
                last_event_seq = last_event_seq + 1, updated_at = ?${extraSetSql}
          WHERE project_id = ? AND id = ? AND revision = ? AND last_event_seq = ?
-           ${params.guard.sql}`,
+           ${guardSql}`,
         [
           params.toState,
           params.resolutionReason,
@@ -721,7 +800,7 @@ export class WorkService {
           work.id,
           params.expectedRevision,
           work.lastEventSeq,
-          ...params.guard.params,
+          ...guardParams,
         ]
       );
     });
@@ -812,11 +891,27 @@ export class WorkService {
           `Work '${superseded.id}' revision conflict: expected ${supersedesExpectedRevision}, current ${superseded.revision}`
         );
       }
+      // Supersession closes the old assignment: the same episode-bound
+      // handoff gate as resolve applies, enforced both here (clean error)
+      // and inside the guarded EXISTS (race-safe). A concurrent handoff or
+      // transfer moves the revision and fails the write explicitly instead
+      // of closing work behind a stale handoff.
+      if (needsHandoffGate(superseded) && !handoffSatisfied(superseded)) {
+        throw new SwitchboardError(
+          'CONFLICT',
+          `Work '${superseded.id}' needs a current safe handoff before it can be superseded: record a stop handoff bound to episode ${superseded.execEpisode} first`,
+          { details: { workId: superseded.id, execEpisode: superseded.execEpisode, stopSeq: superseded.stopSeq } }
+        );
+      }
+      const gatedSupersede = needsHandoffGate(superseded);
       supersedeGuardSql = `AND EXISTS (
         SELECT 1 FROM work_items s
-        WHERE s.project_id = ? AND s.id = ? AND s.revision = ? AND s.state <> 'RESOLVED'
+        WHERE s.project_id = ? AND s.id = ? AND s.revision = ? AND s.state <> 'RESOLVED'${gatedSupersede ? ' AND s.handoff_episode = ? AND s.handoff_stop_seq = ? AND s.handoff_by = ?' : ''}
       )`;
       supersedeGuardParams.push(projectId, superseded.id, supersedesExpectedRevision);
+      if (gatedSupersede) {
+        supersedeGuardParams.push(superseded.execEpisode, superseded.stopSeq, superseded.executorId);
+      }
     }
 
     const reconciliationDeferred = !parsed.supersedesWorkId && related.candidates.length > 0;
@@ -997,6 +1092,11 @@ export class WorkService {
       sets: [
         { sql: 'executor_id = ?', params: [principal.endpointId] },
         { sql: 'claimed_at = COALESCE(claimed_at, ?)', params: [Date.now()] },
+        { sql: 'exec_episode = exec_episode + 1', params: [] },
+        { sql: 'stop_open = 0', params: [] },
+        { sql: 'handoff_episode = NULL', params: [] },
+        { sql: 'handoff_stop_seq = NULL', params: [] },
+        { sql: 'handoff_by = NULL', params: [] },
       ],
       guard: { sql: `AND state = 'UNCLAIMED'`, params: [] },
     });
@@ -1053,6 +1153,7 @@ export class WorkService {
 
     const sets: Array<{ sql: string; params: unknown[] }> = [];
     if (parsed.toState === 'SUBMITTED') sets.push({ sql: 'submitted_at = ?', params: [Date.now()] });
+    if (parsed.toState === 'IN_PROGRESS') sets.push({ sql: 'exec_started_episode = exec_episode', params: [] });
 
     return await this.applyOperation({
       principal,
@@ -1151,6 +1252,8 @@ export class WorkService {
         { sql: 'stop_requested_at = ?', params: [Date.now()] },
         { sql: 'stop_requested_by = ?', params: [principal.endpointId] },
         { sql: 'stop_reason = ?', params: [parsed.reason] },
+        { sql: 'stop_seq = stop_seq + 1', params: [] },
+        { sql: 'stop_open = 1', params: [] },
       ],
       guard: { sql: `AND state = ? AND state <> 'RESOLVED'`, params: [work.state] },
     });
@@ -1170,7 +1273,13 @@ export class WorkService {
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireExecutorOrSteward(principal, work, 'record a stop handoff');
-    if (!work.stopRequestedAt) {
+    // A handoff answers the open stop of the current episode, or records a
+    // proactive handoff for active ownership (bound to the current episode,
+    // stop counter and executor). Either way a later stop or episode
+    // invalidates it; only the live markers decide, never timestamps.
+    const activeOwnership =
+      work.executorId !== null && work.state !== 'UNCLAIMED' && work.state !== 'RESOLVED';
+    if (!work.stopOpen && !activeOwnership) {
       throw new SwitchboardError('CONFLICT', `Work '${work.id}' has no pending stop request to hand off`);
     }
     if (work.state === 'RESOLVED') {
@@ -1192,8 +1301,12 @@ export class WorkService {
       evidenceRefs: parsed.evidenceRefs ?? null,
       sets: [
         { sql: 'stop_handoff_at = ?', params: [Date.now()] },
+        { sql: 'handoff_episode = ?', params: [work.execEpisode] },
+        { sql: 'handoff_stop_seq = ?', params: [work.stopSeq] },
+        { sql: 'handoff_by = ?', params: [principal.endpointId] },
+        { sql: 'stop_open = 0', params: [] },
       ],
-      guard: { sql: `AND stop_requested_at IS NOT NULL AND state <> 'RESOLVED'`, params: [] },
+      guard: { sql: `AND state = ? AND state <> 'RESOLVED'`, params: [work.state] },
     });
   }
 
@@ -1223,6 +1336,7 @@ export class WorkService {
       expectedRevision: parsed.expectedRevision,
       eventType: 'HANDOFF_TRANSFERRED',
       operationHash,
+      enforceHandoff: true,
       toState: work.state === 'UNCLAIMED' ? 'CLAIMED' : work.state,
       resolutionReason: null,
       reason: 'HANDOFF',
@@ -1231,6 +1345,15 @@ export class WorkService {
       sets: [
         { sql: 'executor_id = ?', params: [parsed.toExecutorId] },
         { sql: 'claimed_at = COALESCE(claimed_at, ?)', params: [Date.now()] },
+        { sql: 'exec_episode = exec_episode + 1', params: [] },
+        { sql: 'stop_open = 0', params: [] },
+        { sql: 'handoff_episode = NULL', params: [] },
+        { sql: 'handoff_stop_seq = NULL', params: [] },
+        { sql: 'handoff_by = NULL', params: [] },
+        { sql: 'stop_requested_at = NULL', params: [] },
+        { sql: 'stop_requested_by = NULL', params: [] },
+        { sql: 'stop_reason = NULL', params: [] },
+        { sql: 'stop_handoff_at = NULL', params: [] },
       ],
       guard: { sql: `AND state = ? AND state <> 'RESOLVED'`, params: [work.state] },
     });
@@ -1340,17 +1463,11 @@ export class WorkService {
     if (work.state === 'RESOLVED') {
       throw new SwitchboardError('CONFLICT', `Work '${work.id}' is already resolved (${work.resolutionReason})`);
     }
-    // C1: a requested stop is not a confirmed handoff. While an executor still
-    // owns active work, closing it would silently abandon partial results, so a
-    // recorded stop handoff must come first. Work with no executor has no
-    // partial state to preserve and may resolve directly.
-    if (work.stopRequestedAt && !work.stopHandoffAt && work.executorId) {
-      throw new SwitchboardError(
-        'CONFLICT',
-        `Work '${work.id}' has a pending stop request: record a stop handoff before resolution`,
-        { details: { workId: work.id, stopRequestedAt: work.stopRequestedAt } }
-      );
-    }
+    // C1 episode gate (Lucy-directed): noncompletion closure of active
+    // ownership needs a handoff bound to the current episode, stop request
+    // and executor. Accepted completed submission, truly unclaimed work and
+    // verified no-start are exempt; everything else is enforced both here
+    // (clean error) and inside the guarded mutation (race-safe).
     if (parsed.reason === 'COMPLETED' && !['SUBMITTED', 'REVIEW'].includes(work.state)) {
       throw new SwitchboardError(
         'CONFLICT',
@@ -1391,6 +1508,7 @@ export class WorkService {
       expectedRevision: parsed.expectedRevision,
       eventType: 'RESOLVED',
       operationHash,
+      enforceHandoff: parsed.reason !== 'COMPLETED',
       toState: 'RESOLVED',
       resolutionReason: parsed.reason,
       reason: parsed.reason,
@@ -1450,6 +1568,15 @@ export class WorkService {
         { sql: 'resolved_by = NULL', params: [] },
         { sql: 'archived_at = NULL', params: [] },
         { sql: 'reconciliation_deferred = 0', params: [] },
+        { sql: 'exec_episode = exec_episode + 1', params: [] },
+        { sql: 'stop_open = 0', params: [] },
+        { sql: 'handoff_episode = NULL', params: [] },
+        { sql: 'handoff_stop_seq = NULL', params: [] },
+        { sql: 'handoff_by = NULL', params: [] },
+        { sql: 'stop_requested_at = NULL', params: [] },
+        { sql: 'stop_requested_by = NULL', params: [] },
+        { sql: 'stop_reason = NULL', params: [] },
+        { sql: 'stop_handoff_at = NULL', params: [] },
       ],
       guard: { sql: `AND state = 'RESOLVED'`, params: [] },
     });

@@ -82,15 +82,38 @@ describe('Sweep consolidation repairs (SWB-CONSOLIDATE-001)', () => {
       })
     ).rejects.toMatchObject({ code: 'CONFLICT' });
 
-    // A transfer does not waive the handoff either: the obligation persists.
+    // A conflicting transfer does not waive the handoff either.
+    await expect(
+      work.transfer(comm, {
+        workId: 'c1-work',
+        operationId: 'op-c1-transfer-early',
+        expectedRevision: detail.work.revision,
+        toExecutorId: 'peer',
+        note: 'Peer takes over the stopped work',
+      })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    // The current executor records the handoff; only then may the work move.
+    await work.recordStopHandoff(maker, {
+      workId: 'c1-work',
+      operationId: 'op-c1-handoff',
+      expectedRevision: detail.work.revision,
+      note: 'Partial work preserved on branch feat/c1',
+    });
+    const handedOff = await work.get(comm, 'c1-work');
     await work.transfer(comm, {
       workId: 'c1-work',
       operationId: 'op-c1-transfer',
-      expectedRevision: detail.work.revision,
+      expectedRevision: handedOff.work.revision,
       toExecutorId: 'peer',
       note: 'Peer takes over the stopped work',
     });
+    // The transfer opened a new episode with cleared markers: the old
+    // handoff proves nothing about the new ownership, so closing the work
+    // needs a fresh handoff bound to the new episode and executor.
     const afterTransfer = await work.get(comm, 'c1-work');
+    expect(afterTransfer.work.execEpisode).toBeGreaterThan(handedOff.work.execEpisode);
+    expect(afterTransfer.work.stopOpen).toBe(false);
     await expect(
       work.resolve(comm, {
         workId: 'c1-work',
@@ -102,9 +125,9 @@ describe('Sweep consolidation repairs (SWB-CONSOLIDATE-001)', () => {
 
     await work.recordStopHandoff(peer, {
       workId: 'c1-work',
-      operationId: 'op-c1-handoff',
+      operationId: 'op-c1-handoff-2',
       expectedRevision: afterTransfer.work.revision,
-      note: 'Partial work preserved on branch feat/c1',
+      note: 'Peer confirms partial work on branch feat/c1',
     });
     const ready = await work.get(comm, 'c1-work');
     const closed = await work.resolve(comm, {
@@ -139,6 +162,132 @@ describe('Sweep consolidation repairs (SWB-CONSOLIDATE-001)', () => {
       reason: 'CANCELLED',
     });
     expect(closed.state).toBe('RESOLVED');
+  });
+
+  it('C1: a stale handoff does not survive a new stop, a transfer or a reopen', async () => {
+    async function startActive(id: string) {
+      await work.commission(comm, {
+        id,
+        operationId: `op-${id}-commission`,
+        objective: `Episode probe ${id}`,
+        priority: 'normal',
+      });
+      const c = await work.get(comm, id);
+      await work.claim(maker, { workId: id, operationId: `op-${id}-claim`, expectedRevision: c.work.revision });
+      const k = await work.get(comm, id);
+      await work.transition(maker, {
+        workId: id,
+        operationId: `op-${id}-start`,
+        expectedRevision: k.work.revision,
+        toState: 'IN_PROGRESS',
+      });
+      return await work.get(comm, id);
+    }
+
+    // New stop invalidates a prior handoff.
+    let detail = await startActive('c1-stale');
+    await work.requestStop(comm, { workId: 'c1-stale', operationId: 'op-c1s-stop1', expectedRevision: detail.work.revision, reason: 'First stop' });
+    detail = await work.get(comm, 'c1-stale');
+    await work.recordStopHandoff(maker, { workId: 'c1-stale', operationId: 'op-c1s-hand1', expectedRevision: detail.work.revision, note: 'Handoff one' });
+    detail = await work.get(comm, 'c1-stale');
+    await work.requestStop(comm, { workId: 'c1-stale', operationId: 'op-c1s-stop2', expectedRevision: detail.work.revision, reason: 'Second stop' });
+    detail = await work.get(comm, 'c1-stale');
+    expect(detail.work.stopOpen).toBe(true);
+    await expect(
+      work.resolve(comm, { workId: 'c1-stale', operationId: 'op-c1s-resolve-early', expectedRevision: detail.work.revision, reason: 'CANCELLED' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    await work.recordStopHandoff(maker, { workId: 'c1-stale', operationId: 'op-c1s-hand2', expectedRevision: detail.work.revision, note: 'Handoff two' });
+    detail = await work.get(comm, 'c1-stale');
+    const closed = await work.resolve(comm, { workId: 'c1-stale', operationId: 'op-c1s-resolve', expectedRevision: detail.work.revision, reason: 'OBSOLETE' });
+    expect(closed.state).toBe('RESOLVED');
+
+    // Reopen starts a new episode with cleared markers; history is preserved.
+    const reopened = await work.reopen(comm, { workId: 'c1-stale', operationId: 'op-c1s-reopen', expectedRevision: closed.revision, reason: 'Still needed' });
+    expect(reopened.state).toBe('CLAIMED');
+    const afterReopen = await work.get(comm, 'c1-stale');
+    expect(afterReopen.work.stopRequestedAt).toBeNull();
+    expect(afterReopen.work.stopHandoffAt).toBeNull();
+    expect(afterReopen.work.execEpisode).toBe(detail.work.execEpisode + 1);
+    const resolution = afterReopen.events.find((e) => e.eventType === 'RESOLVED');
+    expect(resolution?.resultingResolutionReason).toBe('OBSOLETE');
+    await expect(
+      work.resolve(comm, { workId: 'c1-stale', operationId: 'op-c1s-resolve-2', expectedRevision: afterReopen.work.revision, reason: 'CANCELLED' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    await work.recordStopHandoff(maker, { workId: 'c1-stale', operationId: 'op-c1s-hand3', expectedRevision: afterReopen.work.revision, note: 'Handoff for new episode' });
+    const ready = await work.get(comm, 'c1-stale');
+    const closedAgain = await work.resolve(comm, { workId: 'c1-stale', operationId: 'op-c1s-resolve-3', expectedRevision: ready.work.revision, reason: 'CANCELLED' });
+    expect(closedAgain.state).toBe('RESOLVED');
+  });
+
+  it('C1: active work with no stop cannot close without a proactive handoff; idle work stays exempt', async () => {
+    await work.commission(comm, { id: 'c1-nostop', operationId: 'op-c1n-commission', objective: 'Never stopped', priority: 'normal' });
+    let detail = await work.get(comm, 'c1-nostop');
+    await work.claim(maker, { workId: 'c1-nostop', operationId: 'op-c1n-claim', expectedRevision: detail.work.revision });
+    detail = await work.get(comm, 'c1-nostop');
+    await work.transition(maker, { workId: 'c1-nostop', operationId: 'op-c1n-start', expectedRevision: detail.work.revision, toState: 'IN_PROGRESS' });
+    detail = await work.get(comm, 'c1-nostop');
+    await expect(
+      work.resolve(comm, { workId: 'c1-nostop', operationId: 'op-c1n-resolve-early', expectedRevision: detail.work.revision, reason: 'CANCELLED' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    // A proactive handoff (no stop was ever requested) satisfies the gate.
+    await work.recordStopHandoff(maker, { workId: 'c1-nostop', operationId: 'op-c1n-hand', expectedRevision: detail.work.revision, note: 'Wrapping up cleanly' });
+    detail = await work.get(comm, 'c1-nostop');
+    const closed = await work.resolve(comm, { workId: 'c1-nostop', operationId: 'op-c1n-resolve', expectedRevision: detail.work.revision, reason: 'OBSOLETE' });
+    expect(closed.state).toBe('RESOLVED');
+
+    // Unclaimed work and verified no-start work need no handoff.
+    await work.commission(comm, { id: 'c1-idle2', operationId: 'op-c1i2-commission', objective: 'Idle', priority: 'low' });
+    detail = await work.get(comm, 'c1-idle2');
+    const idleClosed = await work.resolve(comm, { workId: 'c1-idle2', operationId: 'op-c1i2-resolve', expectedRevision: detail.work.revision, reason: 'CANCELLED' });
+    expect(idleClosed.state).toBe('RESOLVED');
+
+    await work.commission(comm, { id: 'c1-nostart', operationId: 'op-c1ns-commission', objective: 'Claimed but never started', priority: 'normal' });
+    detail = await work.get(comm, 'c1-nostart');
+    await work.claim(maker, { workId: 'c1-nostart', operationId: 'op-c1ns-claim', expectedRevision: detail.work.revision });
+    detail = await work.get(comm, 'c1-nostart');
+    const moved = await work.transfer(comm, { workId: 'c1-nostart', operationId: 'op-c1ns-transfer', expectedRevision: detail.work.revision, toExecutorId: 'peer', note: 'Reassign before start' });
+    expect(moved.state).toBe('CLAIMED');
+    const ready = await work.get(comm, 'c1-nostart');
+    const noStartClosed = await work.resolve(comm, { workId: 'c1-nostart', operationId: 'op-c1ns-resolve', expectedRevision: ready.work.revision, reason: 'CANCELLED' });
+    expect(noStartClosed.state).toBe('RESOLVED');
+  });
+
+  it('C1: superseding active work needs a current handoff; the replacement is never orphaned', async () => {
+    await work.commission(comm, { id: 'c1-sup-old', operationId: 'op-c1sup-commission', objective: 'Old direction', priority: 'normal' });
+    let detail = await work.get(comm, 'c1-sup-old');
+    await work.claim(maker, { workId: 'c1-sup-old', operationId: 'op-c1sup-claim', expectedRevision: detail.work.revision });
+    detail = await work.get(comm, 'c1-sup-old');
+    await work.transition(maker, { workId: 'c1-sup-old', operationId: 'op-c1sup-start', expectedRevision: detail.work.revision, toState: 'IN_PROGRESS' });
+
+    detail = await work.get(comm, 'c1-sup-old');
+    await expect(
+      work.commission(comm, {
+        id: 'c1-sup-new',
+        operationId: 'op-c1sup-new-commission',
+        objective: 'New direction',
+        priority: 'normal',
+        supersedesWorkId: 'c1-sup-old',
+        supersedesExpectedRevision: detail.work.revision,
+      })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    // The failed supersession created no replacement: nothing orphaned.
+    await expect(work.get(comm, 'c1-sup-new')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    await work.recordStopHandoff(maker, { workId: 'c1-sup-old', operationId: 'op-c1sup-hand', expectedRevision: detail.work.revision, note: 'Old work parked' });
+    detail = await work.get(comm, 'c1-sup-old');
+    const replacement = await work.commission(comm, {
+      id: 'c1-sup-new',
+      operationId: 'op-c1sup-new-commission',
+      objective: 'New direction',
+      priority: 'normal',
+      supersedesWorkId: 'c1-sup-old',
+      supersedesExpectedRevision: detail.work.revision,
+    });
+    expect(replacement.work.replacesWorkId).toBe('c1-sup-old');
+    const old = await work.get(comm, 'c1-sup-old');
+    expect(old.work.state).toBe('RESOLVED');
+    expect(old.work.resolutionReason).toBe('SUPERSEDED');
   });
 
   it('C2: same operation id with different content is a conflict, not a replay', async () => {
@@ -401,6 +550,40 @@ describe('Sweep consolidation repairs (SWB-CONSOLIDATE-001)', () => {
     const backup = await service.createScheduledBackup(projectId);
     const restoredBackup = await service.restoreFromBackup(lucy, backup.id);
     expect(restoredBackup.backupId).toBe(backup.id);
+  });
+
+  it('migration 0004 backfills episode markers for legacy stop and execution state', async () => {
+    const legacy = new SqliteAdapter(':memory:');
+    await legacy.exec(readFileSync('src/db/migrations/0001_initial_schema.sql', 'utf8'));
+    await legacy.exec(readFileSync('src/db/migrations/0002_work_records.sql', 'utf8'));
+    await legacy.exec(readFileSync('src/db/migrations/0003_work_event_receipts.sql', 'utf8'));
+    const seed = async (id: string, state: string, stopRequested: boolean, handoff: boolean, executor: string | null) => {
+      await legacy.execute(
+        `INSERT INTO work_items (project_id, id, state, priority, objective, commissioner_id, commissioner_role, executor_id, stop_requested_at, stop_requested_by, stop_handoff_at, created_at, updated_at)
+         VALUES ('p', ?, ?, 'normal', 'legacy', 'comm', 'agent', ?, ?, ?, ?, 1, 1)`,
+        [id, state, executor, stopRequested ? 1 : null, stopRequested ? 'comm' : null, handoff ? 2 : null]
+      );
+    };
+    await seed('w-pending', 'IN_PROGRESS', true, false, 'maker');
+    await seed('w-handed', 'WAITING', true, true, 'maker');
+    await seed('w-idle', 'UNCLAIMED', false, false, null);
+    await legacy.exec(readFileSync('src/db/migrations/0004_work_episodes.sql', 'utf8'));
+
+    const row = async (id: string) =>
+      await legacy.queryFirst<any>(`SELECT exec_episode, stop_seq, stop_open, handoff_episode, handoff_stop_seq, handoff_by, exec_started_episode FROM work_items WHERE id = ?`, [id]);
+    expect(await row('w-pending')).toMatchObject({ exec_episode: 0, stop_seq: 1, stop_open: 1, handoff_episode: null, exec_started_episode: 0 });
+    expect(await row('w-handed')).toMatchObject({ exec_episode: 0, stop_seq: 1, stop_open: 0, handoff_episode: 0, handoff_stop_seq: 1, handoff_by: 'maker' });
+    expect(await row('w-idle')).toMatchObject({ exec_episode: 0, stop_seq: 0, stop_open: 0, handoff_episode: null, exec_started_episode: null });
+
+    // The backfilled pending stop still gates closure under the new code.
+    const targetWork = new WorkService(legacy);
+    const targetAuth = new AuthService(legacy);
+    await targetAuth.createProject('p', 'Legacy');
+    const lead = { endpointId: 'comm', projectId: 'p', scopes: ['read', 'write'], role: 'agent' as const };
+    const detail = await targetWork.get(lead, 'w-pending');
+    await expect(
+      targetWork.resolve(lead, { workId: 'w-pending', operationId: 'op-legacy-resolve', expectedRevision: detail.work.revision, reason: 'CANCELLED' })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
   it('migration 0003 upgrades a pre-repair database and backfills resolved reasons', async () => {

@@ -98,10 +98,17 @@ Independent review of `cada310` found six issues; the high and medium ones
 are repaired on this branch, with regression tests in
 `tests/integration/work-consolidation-repairs.test.ts`:
 
-- **C1 (active-work closure):** `resolve` now refuses with `CONFLICT` while a
-  stop request is pending and no handoff is recorded, whenever an executor
-  still owns the work. Unclaimed work may still resolve directly. Transferring
-  the work does not waive the handoff.
+- **C1 (episode-bound handoff, Lucy-directed):** every claim, transfer and
+  reopen opens a new execution episode (`exec_episode`, migration `0004`).
+  Stop and handoff markers belong to exactly one episode: a handoff is bound
+  to (episode, stop request, executor), a new stop invalidates any prior
+  handoff, and a new episode resets the live markers (history stays in
+  `work_events`). Noncompletion closure, conflicting transfer and
+  supersession of active ownership require a current-episode handoff,
+  enforced inside the guarded SQL as well as up front; accepted completed
+  submissions, truly unclaimed work and verified no-start stay exempt.
+  Migration `0004` backfills legacy rows (pending stops gate, recorded
+  handoffs bind to episode 0, in-flight states count as started).
 - **C2 (idempotency and receipts):** every mutating operation binds its
   operation id to a canonical content hash (`operation_hash`, migration
   `0003_work_event_receipts.sql`). A replay with different content is a

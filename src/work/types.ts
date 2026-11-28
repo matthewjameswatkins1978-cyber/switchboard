@@ -69,6 +69,20 @@ export interface WorkItem {
   stopRequestedBy: string | null;
   stopReason: string | null;
   stopHandoffAt: number | null;
+  /** Execution episode: bumped on claim, transfer and reopen. Handoff markers belong to exactly one episode. */
+  execEpisode: number;
+  /** Monotonic stop-request counter; a new request invalidates any prior handoff binding. */
+  stopSeq: number;
+  /** 1 while a stop request of the current episode awaits a handoff. */
+  stopOpen: boolean;
+  /** Episode the accepted handoff belongs to; must equal execEpisode to satisfy the gate. */
+  handoffEpisode: number | null;
+  /** Stop request the accepted handoff answers; must equal stopSeq. */
+  handoffStopSeq: number | null;
+  /** Executor (or steward) that recorded the accepted handoff; must equal the current executor. */
+  handoffBy: string | null;
+  /** Episode in which execution first entered IN_PROGRESS; NULL means verified no-start. */
+  execStartedEpisode: number | null;
   reconciliationDeferred: boolean;
   archivedAt: number | null;
   revision: number;
