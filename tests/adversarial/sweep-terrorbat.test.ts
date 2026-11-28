@@ -319,24 +319,29 @@ describe('Work lifecycle adversarial checks (SWB-SWEEP-001)', () => {
         expectedRevision: 2,
         toState: 'SUBMITTED',
       });
-      if (reason === 'SUPERSEDED') {
-        await commission(`${id}-replacement`);
-        await work.resolve(lead, {
+      // Noncompletion closure of executed work needs a current handoff;
+      // accepted completion does not. The handoff is recorded once here.
+      if (reason !== 'COMPLETED') {
+        await work.recordStopHandoff(maker, {
           workId: id,
-          operationId: `op-resolve-${id}`,
+          operationId: `op-handoff-${id}`,
           expectedRevision: 3,
-          reason,
-          replacementWorkId: `${id}-replacement`,
-        });
-      } else {
-        await work.resolve(lead, {
-          workId: id,
-          operationId: `op-resolve-${id}`,
-          expectedRevision: 3,
-          reason,
+          note: `Handoff before ${reason}`,
         });
       }
-      await work.archive(lead, { workId: id, operationId: `op-archive-${id}`, expectedRevision: 4 });
+      if (reason === 'SUPERSEDED') {
+        await commission(`${id}-replacement`);
+      }
+      const ready = await work.get(lead, id);
+      await work.resolve(lead, {
+        workId: id,
+        operationId: `op-resolve-${id}`,
+        expectedRevision: ready.work.revision,
+        reason,
+        ...(reason === 'SUPERSEDED' ? { replacementWorkId: `${id}-replacement` } : {}),
+      });
+      const resolved = await work.get(lead, id);
+      await work.archive(lead, { workId: id, operationId: `op-archive-${id}`, expectedRevision: resolved.work.revision });
       const archived = await work.get(lead, id);
       expect(archived.work.resolutionReason).toBe(reason);
       expect(archived.events.at(-1)?.eventType).toBe('ARCHIVED');

@@ -102,13 +102,16 @@ are repaired on this branch, with regression tests in
   reopen opens a new execution episode (`exec_episode`, migration `0004`).
   Stop and handoff markers belong to exactly one episode: a handoff is bound
   to (episode, stop request, executor), a new stop invalidates any prior
-  handoff, and a new episode resets the live markers (history stays in
-  `work_events`). Noncompletion closure, conflicting transfer and
-  supersession of active ownership require a current-episode handoff,
-  enforced inside the guarded SQL as well as up front; accepted completed
-  submissions, truly unclaimed work and verified no-start stay exempt.
-  Migration `0004` backfills legacy rows (pending stops gate, recorded
-  handoffs bind to episode 0, in-flight states count as started).
+  handoff, resuming execution (any transition into `IN_PROGRESS`) clears
+  the binding atomically, and a new episode resets the live markers
+  (history stays in `work_events`). Noncompletion closure, conflicting
+  transfer and supersession of active ownership require a current-episode
+  handoff, enforced inside the guarded SQL as well as up front; accepted
+  completed submissions, truly unclaimed work and verified no-start
+  (claimed but never left `CLAIMED` or stopped) stay exempt. Legacy
+  handoffs are never trusted on live rows: migration `0004` backfills
+  pending stops and in-flight starts but binds handoffs only on already
+  RESOLVED rows.
 - **C2 (idempotency and receipts):** every mutating operation binds its
   operation id to a canonical content hash (`operation_hash`, migration
   `0003_work_event_receipts.sql`). A replay with different content is a

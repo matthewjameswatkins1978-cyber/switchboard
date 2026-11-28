@@ -266,10 +266,19 @@ function needsHandoffGate(work: WorkItem): boolean {
   if (work.executorId === null || work.state === 'UNCLAIMED' || work.state === 'RESOLVED') {
     return false;
   }
-  const startedInEpisode =
-    work.execStartedEpisode !== null && work.execStartedEpisode === work.execEpisode;
-  const stoppedInHistory = work.stopSeq > 0 || work.stopOpen;
-  return startedInEpisode || stoppedInHistory;
+  // Verified no-start is narrow: never entered IN_PROGRESS in this episode,
+  // never left the unclaimed/claimed states, and never stopped. Presence in
+  // WAITING, BLOCKED, SUBMITTED or REVIEW implies execution activity even
+  // without an IN_PROGRESS record, so it never counts as no-start.
+  const neverStarted =
+    (work.execStartedEpisode === null || work.execStartedEpisode !== work.execEpisode) &&
+    work.state === 'CLAIMED' &&
+    work.stopSeq === 0 &&
+    !work.stopOpen;
+  if (neverStarted) {
+    return false;
+  }
+  return true;
 }
 
 function candidateFrom(work: WorkItem, matchReasons: string[] = []): WorkCandidate {
@@ -1153,7 +1162,15 @@ export class WorkService {
 
     const sets: Array<{ sql: string; params: unknown[] }> = [];
     if (parsed.toState === 'SUBMITTED') sets.push({ sql: 'submitted_at = ?', params: [Date.now()] });
-    if (parsed.toState === 'IN_PROGRESS') sets.push({ sql: 'exec_started_episode = exec_episode', params: [] });
+    // Resumed execution invalidates any prior handoff atomically in the same
+    // guarded write: execution after the handoff may have changed the partial
+    // work the handoff described, so the old binding must not satisfy the gate.
+    if (parsed.toState === 'IN_PROGRESS') {
+      sets.push({ sql: 'exec_started_episode = exec_episode', params: [] });
+      sets.push({ sql: 'handoff_episode = NULL', params: [] });
+      sets.push({ sql: 'handoff_stop_seq = NULL', params: [] });
+      sets.push({ sql: 'handoff_by = NULL', params: [] });
+    }
 
     return await this.applyOperation({
       principal,

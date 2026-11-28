@@ -24,21 +24,27 @@ ALTER TABLE work_items ADD COLUMN handoff_stop_seq INTEGER;
 ALTER TABLE work_items ADD COLUMN handoff_by TEXT;
 ALTER TABLE work_items ADD COLUMN exec_started_episode INTEGER;
 
--- Backfill legacy rows so the gate treats them as the old code did:
--- a pending legacy stop stays pending in episode 0; a recorded legacy
--- handoff binds to episode 0 and stop 1; work already past UNCLAIMED
--- counts as started.
+-- Backfill legacy rows conservatively. A pending legacy stop stays pending
+-- (stop_seq 1, stop open) in episode 0; a recorded legacy handoff keeps its
+-- answered stop closed. But a handoff binding is only carried over where no
+-- resumed execution could have followed it — i.e. never for live rows,
+-- whose history the migration cannot see. Live legacy work therefore needs
+-- one fresh handoff under the new rules; RESOLVED rows keep their binding
+-- informationally (the gate never applies to resolved work).
 UPDATE work_items
 SET stop_seq = 1, stop_open = 1
 WHERE stop_requested_at IS NOT NULL AND stop_handoff_at IS NULL;
 
 UPDATE work_items
 SET stop_seq = 1,
-    stop_open = 0,
-    handoff_episode = 0,
+    stop_open = 0
+WHERE stop_handoff_at IS NOT NULL;
+
+UPDATE work_items
+SET handoff_episode = 0,
     handoff_stop_seq = 1,
     handoff_by = COALESCE(executor_id, stop_requested_by)
-WHERE stop_handoff_at IS NOT NULL;
+WHERE stop_handoff_at IS NOT NULL AND state = 'RESOLVED';
 
 UPDATE work_items
 SET exec_started_episode = 0
