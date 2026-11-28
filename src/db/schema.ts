@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS work_events (
   operation_id TEXT NOT NULL,
   expected_revision INTEGER,
   resulting_revision INTEGER NOT NULL,
+  resulting_resolution_reason TEXT CHECK (resulting_resolution_reason IN ('COMPLETED', 'SUPERSEDED', 'OBSOLETE', 'CANCELLED', 'DUPLICATE')),
+  operation_hash TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (project_id, work_id, seq)
 );

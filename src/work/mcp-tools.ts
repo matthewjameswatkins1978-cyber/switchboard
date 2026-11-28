@@ -303,4 +303,42 @@ export function registerWorkTools(server: McpServer, work: WorkService, principa
         limit: params.limit,
       }))
   );
+
+  server.tool(
+    'record_reconciliation',
+    {
+      work_id: z.string(),
+      operation_id: operationId,
+      expected_revision: expectedRevision,
+      decision: z.enum(['retained', 'reprioritised', 'combined', 'superseded', 'withdrawn', 'cancelled', 'referred']),
+      note: z.string().optional(),
+    },
+    async (params) =>
+      json(await work.resolveReconciliation(principal, {
+        workId: params.work_id,
+        operationId: params.operation_id,
+        expectedRevision: params.expected_revision,
+        decision: params.decision,
+        note: params.note,
+      }))
+  );
+
+  server.tool(
+    'transfer_commissionership',
+    {
+      work_id: z.string(),
+      operation_id: operationId,
+      expected_revision: expectedRevision,
+      to_commissioner_id: z.string(),
+      note: z.string(),
+    },
+    async (params) =>
+      json(await work.transferCommissionership(principal, {
+        workId: params.work_id,
+        operationId: params.operation_id,
+        expectedRevision: params.expected_revision,
+        toCommissionerId: params.to_commissioner_id,
+        note: params.note,
+      }))
+  );
 }

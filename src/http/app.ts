@@ -316,6 +316,8 @@ export function createSwitchboardApp(deps: AppDependencies) {
     'release-proposal': (principal, body, workId) => work.proposeRelease(principal, { ...body, workId }),
     reopen: (principal, body, workId) => work.reopen(principal, { ...body, workId }),
     archive: (principal, body, workId) => work.archive(principal, { ...body, workId }),
+    reconcile: (principal, body, workId) => work.resolveReconciliation(principal, { ...body, workId }),
+    'transfer-commission': (principal, body, workId) => work.transferCommissionership(principal, { ...body, workId }),
   };
 
   app.post('/api/v1/work/:id/:action', async (c) => {

@@ -174,6 +174,63 @@ export interface ExportData {
     acknowledgementNote: string | null;
   }>;
   statuses: EndpointStatusRecord[];
+  /**
+   * Optional work-lifecycle records (SWB-SWEEP-001). Raw row shapes, kept
+   * explicit so a backup stays interpretable without domain code. Absent in
+   * pre-Sweep exports; import tolerates that and preserves work when present.
+   */
+  workItems?: Array<{
+    projectId: string;
+    id: string;
+    state: string;
+    resolutionReason: string | null;
+    priority: Priority;
+    objective: string;
+    scopeRefs: string | null;
+    acceptanceCriteria: string | null;
+    evidenceRefs: string | null;
+    dependsOn: string | null;
+    commissionerId: string;
+    commissionerRole: string;
+    executorId: string | null;
+    claimedAt: number | null;
+    submittedAt: number | null;
+    resolvedAt: number | null;
+    resolvedBy: string | null;
+    threadId: string | null;
+    sourceMessageId: string | null;
+    replacesWorkId: string | null;
+    supersededByWorkId: string | null;
+    stopRequestedAt: number | null;
+    stopRequestedBy: string | null;
+    stopReason: string | null;
+    stopHandoffAt: number | null;
+    reconciliationDeferred: number;
+    archivedAt: number | null;
+    revision: number;
+    lastEventSeq: number;
+    createdAt: number;
+    updatedAt: number;
+  }>;
+  workEvents?: Array<{
+    projectId: string;
+    workId: string;
+    seq: number;
+    eventType: string;
+    fromState: string | null;
+    toState: string;
+    actorId: string;
+    actorRole: string;
+    reason: string | null;
+    note: string | null;
+    evidenceRefs: string | null;
+    operationId: string;
+    expectedRevision: number | null;
+    resultingRevision: number;
+    resultingResolutionReason: string | null;
+    operationHash: string | null;
+    createdAt: number;
+  }>;
   archivedMessages?: StoredMessage[];
   archivedDeliveries?: Array<{
     id: number;

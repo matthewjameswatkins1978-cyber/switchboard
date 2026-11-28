@@ -87,8 +87,51 @@ operations are exposed as MCP tools (`commission_work`, `claim_work`,
 `update_work`, `resolve_work`, `supersede_work`, `request_work_stop`,
 `record_work_stop_handoff`, `transfer_work`, `propose_work_release`,
 `reopen_work`, `archive_work`, `list_work`, `get_work`, `get_work_board`,
-`related_work`) and over HTTP under `/api/v1/work`, `/api/v1/work-board`,
-`/api/v1/work/:id` and `/api/v1/work/:id/<action>`.
+`related_work`, `record_reconciliation`, `transfer_commissionership`)
+and over HTTP under `/api/v1/work`, `/api/v1/work-board`,
+`/api/v1/work/:id` and `/api/v1/work/:id/<action>`
+(`reconcile`, `transfer-commission`).
+
+## Consolidation repairs (SWB-CONSOLIDATE-001 Phase C)
+
+Independent review of `cada310` found six issues; the high and medium ones
+are repaired on this branch, with regression tests in
+`tests/integration/work-consolidation-repairs.test.ts`:
+
+- **C1 (active-work closure):** `resolve` now refuses with `CONFLICT` while a
+  stop request is pending and no handoff is recorded, whenever an executor
+  still owns the work. Unclaimed work may still resolve directly. Transferring
+  the work does not waive the handoff.
+- **C2 (idempotency and receipts):** every mutating operation binds its
+  operation id to a canonical content hash (`operation_hash`, migration
+  `0003_work_event_receipts.sql`). A replay with different content is a
+  `CONFLICT`, never an accepted replay. A replay by anyone other than the
+  original actor must pass the fresh operation's authority check first;
+  otherwise it is `FORBIDDEN` with no receipt. Receipts now carry the reason
+  snapshotted at commit time (`resulting_resolution_reason`), so history
+  stays stable across later reopening, transfer or re-resolution.
+  Internally derived ids (`<op>:supersede`) are hash-bound the same way.
+- **C3 (commissioner succession):** `transferCommissionership` moves the
+  commissioner's responsibility explicitly (commissioner or steward only,
+  target must exist, revision-guarded, receipted). A departing model no
+  longer strands its commissions.
+- **C4 (reconciliation correctness):** `relatedWork` now returns the true
+  uncapped `outstandingCount` plus an explicit `truncated` flag, so omitted
+  candidates are visible instead of silent. `resolveReconciliation` records
+  the commissioner's decision (`retained | reprioritised | combined |
+  superseded | withdrawn | cancelled | referred`) as a revision-guarded
+  event and clears the deferred marker.
+- **C6 (hosted storage and recovery):** `exportData`/`importData` (and
+  therefore scheduled backups and restore) include `workItems` and
+  `workEvents` with their receipt columns. Pre-Sweep exports restore
+  cleanly; databases pre-dating the work tables export without work data.
+  Migration `0003` upgrades existing databases and backfills resolved
+  reasons; fresh databases get the columns from `SCHEMA_SQL` directly.
+- **C5 (lifecycle and authority):** reviewed without code change. Steward
+  scope (`admin` role plus `write` scope on the caller's own project
+  credential) is sound; no universal access exists. Transition rules,
+  executor/commissioner separation, evidence handling, cycle prevention
+  and archive access hold as specified.
 
 ## What this slice does not do
 

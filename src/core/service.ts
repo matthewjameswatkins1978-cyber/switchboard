@@ -1166,6 +1166,23 @@ export class SwitchboardService {
        FROM archived_messages WHERE project_id = ?`,
       [principal.projectId]
     );
+    const workItems = await this.db.query<any>(
+      `SELECT project_id, id, state, resolution_reason, priority, objective, scope_refs,
+              acceptance_criteria, evidence_refs, depends_on, commissioner_id, commissioner_role,
+              executor_id, claimed_at, submitted_at, resolved_at, resolved_by, thread_id,
+              source_message_id, replaces_work_id, superseded_by_work_id, stop_requested_at,
+              stop_requested_by, stop_reason, stop_handoff_at, reconciliation_deferred,
+              archived_at, revision, last_event_seq, created_at, updated_at
+       FROM work_items WHERE project_id = ? ORDER BY created_at ASC, id ASC`,
+      [principal.projectId]
+    ).catch(() => []);
+    const workEvents = await this.db.query<any>(
+      `SELECT project_id, work_id, seq, event_type, from_state, to_state, actor_id,
+              actor_role, reason, note, evidence_refs, operation_id, expected_revision,
+              resulting_revision, resulting_resolution_reason, operation_hash, created_at
+       FROM work_events WHERE project_id = ? ORDER BY work_id ASC, seq ASC`,
+      [principal.projectId]
+    ).catch(() => []);
     const archivedDeliveries = await this.db.query<any>(
       `SELECT id, project_id, message_id, sender_id, recipient_id, channel_id,
               sequence, status, delivered_at, received_at, acknowledged_at, acknowledgement_note,
@@ -1232,6 +1249,58 @@ export class SwitchboardService {
         lastHeartbeatAt: s.last_heartbeat_at,
         updatedAt: s.updated_at,
         updatedBy: s.updated_by,
+      })),
+      workItems: workItems.map((w) => ({
+        projectId: w.project_id,
+        id: w.id,
+        state: w.state,
+        resolutionReason: w.resolution_reason ?? null,
+        priority: w.priority,
+        objective: w.objective,
+        scopeRefs: w.scope_refs ?? null,
+        acceptanceCriteria: w.acceptance_criteria ?? null,
+        evidenceRefs: w.evidence_refs ?? null,
+        dependsOn: w.depends_on ?? null,
+        commissionerId: w.commissioner_id,
+        commissionerRole: w.commissioner_role,
+        executorId: w.executor_id ?? null,
+        claimedAt: w.claimed_at ?? null,
+        submittedAt: w.submitted_at ?? null,
+        resolvedAt: w.resolved_at ?? null,
+        resolvedBy: w.resolved_by ?? null,
+        threadId: w.thread_id ?? null,
+        sourceMessageId: w.source_message_id ?? null,
+        replacesWorkId: w.replaces_work_id ?? null,
+        supersededByWorkId: w.superseded_by_work_id ?? null,
+        stopRequestedAt: w.stop_requested_at ?? null,
+        stopRequestedBy: w.stop_requested_by ?? null,
+        stopReason: w.stop_reason ?? null,
+        stopHandoffAt: w.stop_handoff_at ?? null,
+        reconciliationDeferred: Number(w.reconciliation_deferred ?? 0),
+        archivedAt: w.archived_at ?? null,
+        revision: Number(w.revision),
+        lastEventSeq: Number(w.last_event_seq),
+        createdAt: Number(w.created_at),
+        updatedAt: Number(w.updated_at),
+      })),
+      workEvents: workEvents.map((e) => ({
+        projectId: e.project_id,
+        workId: e.work_id,
+        seq: Number(e.seq),
+        eventType: e.event_type,
+        fromState: e.from_state ?? null,
+        toState: e.to_state,
+        actorId: e.actor_id,
+        actorRole: e.actor_role,
+        reason: e.reason ?? null,
+        note: e.note ?? null,
+        evidenceRefs: e.evidence_refs ?? null,
+        operationId: e.operation_id,
+        expectedRevision: e.expected_revision ?? null,
+        resultingRevision: Number(e.resulting_revision),
+        resultingResolutionReason: e.resulting_resolution_reason ?? null,
+        operationHash: e.operation_hash ?? null,
+        createdAt: Number(e.created_at),
       })),
       archivedMessages: archivedMessages.map((m) => ({
         id: m.id,
@@ -1464,7 +1533,53 @@ export class SwitchboardService {
         }
       }
 
-      // 10. Synchronize monotonic endpoint sequences watermark
+      // 10. Work items and their receipt history (INSERT OR REPLACE keeps this
+      // import idempotent; rows already present with identical keys are kept).
+      // Pre-Sweep exports omit these arrays and restore cleanly without them.
+      if (data.workItems) {
+        for (const w of data.workItems) {
+          await tx.execute(
+            `INSERT OR REPLACE INTO work_items
+             (project_id, id, state, resolution_reason, priority, objective, scope_refs,
+              acceptance_criteria, evidence_refs, depends_on, commissioner_id, commissioner_role,
+              executor_id, claimed_at, submitted_at, resolved_at, resolved_by, thread_id,
+              source_message_id, replaces_work_id, superseded_by_work_id, stop_requested_at,
+              stop_requested_by, stop_reason, stop_handoff_at, reconciliation_deferred,
+              archived_at, revision, last_event_seq, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              w.projectId, w.id, w.state, w.resolutionReason ?? null, w.priority, w.objective,
+              w.scopeRefs ?? null, w.acceptanceCriteria ?? null, w.evidenceRefs ?? null,
+              w.dependsOn ?? null, w.commissionerId, w.commissionerRole, w.executorId ?? null,
+              w.claimedAt ?? null, w.submittedAt ?? null, w.resolvedAt ?? null, w.resolvedBy ?? null,
+              w.threadId ?? null, w.sourceMessageId ?? null, w.replacesWorkId ?? null,
+              w.supersededByWorkId ?? null, w.stopRequestedAt ?? null, w.stopRequestedBy ?? null,
+              w.stopReason ?? null, w.stopHandoffAt ?? null, w.reconciliationDeferred ?? 0,
+              w.archivedAt ?? null, w.revision, w.lastEventSeq, w.createdAt, w.updatedAt,
+            ]
+          );
+          count++;
+        }
+      }
+      if (data.workEvents) {
+        for (const e of data.workEvents) {
+          await tx.execute(
+            `INSERT OR REPLACE INTO work_events
+             (project_id, work_id, seq, event_type, from_state, to_state, actor_id,
+              actor_role, reason, note, evidence_refs, operation_id, expected_revision,
+              resulting_revision, resulting_resolution_reason, operation_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              e.projectId, e.workId, e.seq, e.eventType, e.fromState ?? null, e.toState,
+              e.actorId, e.actorRole, e.reason ?? null, e.note ?? null, e.evidenceRefs ?? null,
+              e.operationId, e.expectedRevision ?? null, e.resultingRevision,
+              e.resultingResolutionReason ?? null, e.operationHash ?? null, e.createdAt,
+            ]
+          );
+        }
+      }
+
+      // 11. Synchronize monotonic endpoint sequences watermark
       await tx.execute(
         `INSERT INTO endpoint_sequences (project_id, recipient_id, last_sequence)
          SELECT project_id, recipient_id, MAX(sequence)

@@ -39,7 +39,9 @@ export type WorkEventType =
   | 'RESOLVED'
   | 'REOPENED'
   | 'ARCHIVED'
-  | 'HANDOFF_TRANSFERRED';
+  | 'HANDOFF_TRANSFERRED'
+  | 'RECONCILIATION_RECORDED'
+  | 'COMMISSION_TRANSFERRED';
 
 export interface WorkItem {
   projectId: string;
@@ -90,6 +92,10 @@ export interface WorkEvent {
   operationId: string;
   expectedRevision: number | null;
   resultingRevision: number;
+  /** Reason snapshotted at commit time; unlike live work state, this never drifts. */
+  resultingResolutionReason: WorkResolutionReason | null;
+  /** Binds the operation id to its canonical content; a replay with different content conflicts. */
+  operationHash: string | null;
   createdAt: number;
 }
 
@@ -127,13 +133,20 @@ export interface CommissionWorkResult {
   /** Bounded related outstanding work the commissioner has authority over. */
   relatedCandidates: WorkCandidate[];
   relatedCandidateCount: number;
+  /** True when related work exists beyond the returned candidates. */
+  relatedTruncated: boolean;
   /** True when this commission did not reconcile the related candidates. */
   reconciliationDeferred: boolean;
 }
 
+export type ReconciliationDecision = 'retained' | 'reprioritised' | 'combined' | 'superseded' | 'withdrawn' | 'cancelled' | 'referred';
+
 export interface RelatedWorkResult {
   candidates: WorkCandidate[];
+  /** Total outstanding work under the same filters, uncapped. Never silently truncated. */
   outstandingCount: number;
+  /** True when outstanding work exists beyond the returned candidates. */
+  truncated: boolean;
 }
 
 export interface WorkListResult {

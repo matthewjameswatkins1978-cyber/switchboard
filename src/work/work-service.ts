@@ -1,10 +1,13 @@
 import type { DatabaseSession } from '../db/database.js';
 import type { AuthPrincipal, EndpointRole, Priority } from '../core/types.js';
 import { SwitchboardError } from '../core/errors.js';
+import { sha256 } from '../auth/auth-service.js';
 import {
   ArchiveWorkSchema,
   ClaimWorkSchema,
   CommissionWorkSchema,
+  ResolveReconciliationSchema,
+  TransferCommissionershipSchema,
   ListWorkQuerySchema,
   ProposeReleaseSchema,
   RelatedWorkQuerySchema,
@@ -93,6 +96,8 @@ interface EventRow {
   operation_id: string;
   expected_revision: number | null;
   resulting_revision: number;
+  resulting_resolution_reason: WorkResolutionReason | null;
+  operation_hash: string | null;
   created_at: number;
 }
 
@@ -104,7 +109,7 @@ const WORK_COLUMNS = `project_id, id, state, resolution_reason, priority, object
 
 const EVENT_COLUMNS = `project_id, work_id, seq, event_type, from_state, to_state, actor_id,
   actor_role, reason, note, evidence_refs, operation_id, expected_revision, resulting_revision,
-  created_at`;
+  resulting_resolution_reason, operation_hash, created_at`;
 
 const PRIORITY_RANK_SQL = `CASE priority WHEN 'urgent' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END`;
 
@@ -187,8 +192,33 @@ function mapEvent(row: EventRow): WorkEvent {
     operationId: row.operation_id,
     expectedRevision: row.expected_revision ?? null,
     resultingRevision: Number(row.resulting_revision),
+    resultingResolutionReason: row.resulting_resolution_reason ?? null,
+    operationHash: row.operation_hash ?? null,
     createdAt: Number(row.created_at),
   };
+}
+
+/**
+ * Binds an operation id to its canonical content. Two callers may share an
+ * operation id only when they submit byte-identical canonical content for the
+ * same event type and target; anything else is a conflict, never a replay.
+ * Keys are sorted so field order cannot fork the binding.
+ */
+async function hashOperation(input: Record<string, unknown>): Promise<string> {
+  const canonical = JSON.stringify(sortKeys(input));
+  return await sha256(canonical);
+}
+
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, sortKeys(v)] as const);
+    return Object.fromEntries(entries);
+  }
+  return value;
 }
 
 function candidateFrom(work: WorkItem, matchReasons: string[] = []): WorkCandidate {
@@ -301,14 +331,41 @@ export class WorkService {
     return row ? mapEvent(row) : null;
   }
 
-  private receiptFrom(event: WorkEvent, work: WorkItem | null, isReplay: boolean): WorkReceipt {
+  /**
+   * C2 replay guard. A stored receipt is returned for an operation id only
+   * when the replaying principal passes the same authority check the fresh
+   * operation requires, and only when the canonical content matches what the
+   * id was first committed with. Different content under a known id is a
+   * conflict; an unauthorised caller gets no receipt at all.
+   */
+  private async checkReplay(
+    principal: AuthPrincipal,
+    event: WorkEvent,
+    operationHash: string,
+    authorize: (work: WorkItem) => void
+  ): Promise<WorkReceipt> {
+    const work = await this.loadWork(principal.projectId, event.workId);
+    // The original actor's identical retry is always accepted; anyone else
+    // must satisfy the fresh operation's authority check as it stands now.
+    if (event.actorId !== principal.endpointId) authorize(work);
+    if (event.operationHash !== operationHash) {
+      throw new SwitchboardError(
+        'CONFLICT',
+        `Operation '${event.operationId}' was already committed with different content; choose a new operation id`,
+        { details: { operationId: event.operationId, workId: event.workId } }
+      );
+    }
+    return this.receiptFrom(event, work, true);
+  }
+
+  private receiptFrom(event: WorkEvent, _work: WorkItem | null, isReplay: boolean): WorkReceipt {
     return {
       operationId: event.operationId,
       workId: event.workId,
       eventSeq: event.seq,
       eventType: event.eventType,
       state: event.toState,
-      resolutionReason: work && work.state === 'RESOLVED' ? work.resolutionReason : null,
+      resolutionReason: event.resultingResolutionReason,
       revision: event.resultingRevision,
       actorId: event.actorId,
       at: event.createdAt,
@@ -431,7 +488,12 @@ export class WorkService {
       .slice(0, limit)
       .map((entry) => candidateFrom(entry.work, entry.reasons.length > 0 ? entry.reasons : ['outstanding']));
 
-    return { candidates: ranked, outstandingCount: rows.length };
+    const totalRow = await this.db.queryFirst<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM work_items WHERE ${where.join(' AND ')}`,
+      params
+    );
+    const totalOutstanding = Number(totalRow?.c ?? rows.length);
+    return { candidates: ranked, outstandingCount: totalOutstanding, truncated: totalOutstanding > ranked.length };
   }
 
   async board(principal: AuthPrincipal): Promise<WorkBoard> {
@@ -595,6 +657,7 @@ export class WorkService {
     reason: string | null;
     note: string | null;
     evidenceRefs: string[] | null;
+    operationHash: string;
     sets: Array<{ sql: string; params: unknown[] }>;
     guard: { sql: string; params: unknown[] };
   }): Promise<WorkReceipt> {
@@ -609,8 +672,9 @@ export class WorkService {
       await tx.execute(
         `INSERT INTO work_events
            (project_id, work_id, seq, event_type, from_state, to_state, actor_id, actor_role,
-            reason, note, evidence_refs, operation_id, expected_revision, resulting_revision, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            reason, note, evidence_refs, operation_id, expected_revision, resulting_revision,
+            resulting_resolution_reason, operation_hash, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE EXISTS (
            SELECT 1 FROM work_items
            WHERE project_id = ? AND id = ? AND revision = ? AND last_event_seq = ?
@@ -631,6 +695,8 @@ export class WorkService {
           params.operationId,
           params.expectedRevision,
           resultingRevision,
+          params.resolutionReason,
+          params.operationHash,
           now,
           principal.projectId,
           work.id,
@@ -690,14 +756,17 @@ export class WorkService {
     const projectId = principal.projectId;
     const now = Date.now();
 
+    const operationHash = await hashOperation({ eventType: 'COMMISSIONED', workId: parsed.id, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
     if (replay) {
+      const receipt = await this.checkReplay(principal, replay, operationHash, () => undefined);
       const work = await this.loadWork(projectId, replay.workId);
       return {
         work,
-        receipt: this.receiptFrom(replay, work, true),
+        receipt,
         relatedCandidates: [],
         relatedCandidateCount: 0,
+        relatedTruncated: false,
         reconciliationDeferred: work.reconciliationDeferred,
       };
     }
@@ -776,6 +845,7 @@ export class WorkService {
     ];
 
     const supersedeEventOp = `${parsed.operationId}:supersede`;
+    const supersedeHash = await hashOperation({ eventType: 'RESOLVED', workId: superseded?.id ?? null, via: parsed.operationId });
 
     await this.db.transaction(async (tx) => {
       // New work is created only if the supersession prerequisite still holds,
@@ -794,8 +864,9 @@ export class WorkService {
       await tx.execute(
         `INSERT INTO work_events
            (project_id, work_id, seq, event_type, from_state, to_state, actor_id, actor_role,
-            reason, note, evidence_refs, operation_id, expected_revision, resulting_revision, created_at)
-         SELECT ?, ?, 1, 'COMMISSIONED', NULL, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?
+            reason, note, evidence_refs, operation_id, expected_revision, resulting_revision,
+            resulting_resolution_reason, operation_hash, created_at)
+         SELECT ?, ?, 1, 'COMMISSIONED', NULL, ?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL, ?, ?
          WHERE EXISTS (
            SELECT 1 FROM work_items WHERE project_id = ? AND id = ? AND revision = 1 AND last_event_seq = 1
          )`,
@@ -809,6 +880,7 @@ export class WorkService {
           parsed.note ?? null,
           serializeRefs(parsed.evidenceRefs),
           parsed.operationId,
+          operationHash,
           now,
           projectId,
           parsed.id,
@@ -819,8 +891,9 @@ export class WorkService {
         await tx.execute(
           `INSERT INTO work_events
              (project_id, work_id, seq, event_type, from_state, to_state, actor_id, actor_role,
-              reason, note, evidence_refs, operation_id, expected_revision, resulting_revision, created_at)
-           SELECT ?, ?, ?, 'RESOLVED', ?, 'RESOLVED', ?, ?, 'SUPERSEDED', ?, NULL, ?, ?, ?, ?
+              reason, note, evidence_refs, operation_id, expected_revision, resulting_revision,
+              resulting_resolution_reason, operation_hash, created_at)
+           SELECT ?, ?, ?, 'RESOLVED', ?, 'RESOLVED', ?, ?, 'SUPERSEDED', ?, NULL, ?, ?, ?, 'SUPERSEDED', ?, ?
            WHERE EXISTS (
              SELECT 1 FROM work_items
              WHERE project_id = ? AND id = ? AND revision = ? AND state <> 'RESOLVED'
@@ -836,6 +909,7 @@ export class WorkService {
             supersedeEventOp,
             supersedesExpectedRevision,
             superseded.revision + 1,
+            supersedeHash,
             now,
             projectId,
             superseded.id,
@@ -886,6 +960,7 @@ export class WorkService {
       receipt: this.receiptFrom(event, work, false),
       relatedCandidates: related.candidates,
       relatedCandidateCount: related.outstandingCount,
+      relatedTruncated: related.truncated,
       reconciliationDeferred,
     };
   }
@@ -898,8 +973,9 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = ClaimWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'CLAIMED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) return await this.checkReplay(principal, replay, operationHash, () => undefined);
 
     const work = await this.loadWork(projectId, parsed.workId);
     if (work.state !== 'UNCLAIMED') {
@@ -912,6 +988,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'CLAIMED',
+      operationHash,
       toState: 'CLAIMED',
       resolutionReason: null,
       reason: null,
@@ -930,8 +1007,22 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = TransitionWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'STATE_CHANGED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) => {
+        const steward = this.isSteward(principal);
+        const isExecutor = work.executorId === principal.endpointId;
+        const isCommissioner = work.commissionerId === principal.endpointId;
+        const commissionerAllowed = parsed.toState === 'REVIEW' || parsed.toState === 'IN_PROGRESS';
+        if (!steward && !isExecutor && !(isCommissioner && commissionerAllowed)) {
+          throw new SwitchboardError(
+            'FORBIDDEN',
+            `Only the assigned executor of '' may move it to `
+          );
+        }
+      });
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     if (work.state === 'RESOLVED') {
@@ -969,6 +1060,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'STATE_CHANGED',
+      operationHash,
       toState: parsed.toState,
       resolutionReason: null,
       reason: null,
@@ -986,8 +1078,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = ProposeReleaseSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'RELEASE_PROPOSED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireExecutorOrSteward(principal, work, 'propose release')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireExecutorOrSteward(principal, work, 'propose release');
@@ -1003,6 +1100,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'RELEASE_PROPOSED',
+      operationHash,
       toState: work.state,
       resolutionReason: work.resolutionReason,
       reason: 'RELEASE_PROPOSAL',
@@ -1021,8 +1119,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = StopRequestSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'STOP_REQUESTED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'request a stop')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireCommissionerOrSteward(principal, work, 'request a stop');
@@ -1038,6 +1141,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'STOP_REQUESTED',
+      operationHash,
       toState: work.state,
       resolutionReason: work.resolutionReason,
       reason: parsed.reason,
@@ -1056,8 +1160,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = StopHandoffSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'STOP_HANDOFF_RECORDED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireExecutorOrSteward(principal, work, 'record a stop handoff')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireExecutorOrSteward(principal, work, 'record a stop handoff');
@@ -1075,6 +1184,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'STOP_HANDOFF_RECORDED',
+      operationHash,
       toState: 'WAITING',
       resolutionReason: null,
       reason: 'STOP_HANDOFF',
@@ -1091,8 +1201,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = TransferWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'HANDOFF_TRANSFERRED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'transfer this work')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireCommissionerOrSteward(principal, work, 'transfer this work');
@@ -1107,6 +1222,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'HANDOFF_TRANSFERRED',
+      operationHash,
       toState: work.state === 'UNCLAIMED' ? 'CLAIMED' : work.state,
       resolutionReason: null,
       reason: 'HANDOFF',
@@ -1120,6 +1236,89 @@ export class WorkService {
     });
   }
 
+  /**
+   * C3: explicit authorised commissioner handover. The commissioner's
+   * responsibility moves without touching the executor, the model or any
+   * session: the new commissioner is recorded with authority and receipt,
+   * and the prior commissioner stays in history.
+   */
+  async transferCommissionership(principal: AuthPrincipal, input: unknown): Promise<WorkReceipt> {
+    this.requireWrite(principal);
+    const parsed = TransferCommissionershipSchema.parse(input);
+    const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'COMMISSION_TRANSFERRED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
+    const replay = await this.findEvent(projectId, parsed.operationId);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'transfer commissionership')
+      );
+    }
+
+    const work = await this.loadWork(projectId, parsed.workId);
+    this.requireCommissionerOrSteward(principal, work, 'transfer commissionership');
+    if (work.state === 'RESOLVED') {
+      throw new SwitchboardError('CONFLICT', `Work '${work.id}' is already resolved; reopen it before transfer`);
+    }
+    await this.assertEndpointExists(projectId, parsed.toCommissionerId);
+
+    return await this.applyOperation({
+      principal,
+      work,
+      operationId: parsed.operationId,
+      expectedRevision: parsed.expectedRevision,
+      eventType: 'COMMISSION_TRANSFERRED',
+      toState: work.state,
+      resolutionReason: work.resolutionReason,
+      reason: 'COMMISSION_HANDOFF',
+      note: parsed.note,
+      evidenceRefs: null,
+      operationHash,
+      sets: [{ sql: 'commissioner_id = ?', params: [parsed.toCommissionerId] }],
+      guard: { sql: `AND state = ? AND state <> 'RESOLVED'`, params: [work.state] },
+    });
+  }
+
+  /**
+   * C4: explicit revision-safe reconciliation disposition. Records what the
+   * commissioner decided about deferred related work and clears the marker so
+   * the board stops surfacing it. Urgent work may proceed first and reconcile
+   * afterwards through this same operation.
+   */
+  async resolveReconciliation(principal: AuthPrincipal, input: unknown): Promise<WorkReceipt> {
+    this.requireWrite(principal);
+    const parsed = ResolveReconciliationSchema.parse(input);
+    const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'RECONCILIATION_RECORDED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
+    const replay = await this.findEvent(projectId, parsed.operationId);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'record reconciliation')
+      );
+    }
+
+    const work = await this.loadWork(projectId, parsed.workId);
+    this.requireCommissionerOrSteward(principal, work, 'record reconciliation');
+    if (!work.reconciliationDeferred) {
+      throw new SwitchboardError('CONFLICT', `Work '${work.id}' has no deferred reconciliation to record`);
+    }
+
+    return await this.applyOperation({
+      principal,
+      work,
+      operationId: parsed.operationId,
+      expectedRevision: parsed.expectedRevision,
+      eventType: 'RECONCILIATION_RECORDED',
+      toState: work.state,
+      resolutionReason: work.resolutionReason,
+      reason: parsed.decision,
+      note: parsed.note ?? null,
+      evidenceRefs: null,
+      operationHash,
+      sets: [{ sql: 'reconciliation_deferred = 0', params: [] }],
+      guard: { sql: `AND state = ? AND reconciliation_deferred = 1`, params: [work.state] },
+    });
+  }
+
   // ---------------------------------------------------------------------
   // Resolution, supersession, reopen and archive
   // ---------------------------------------------------------------------
@@ -1128,13 +1327,29 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = ResolveWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'RESOLVED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'resolve this work')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireCommissionerOrSteward(principal, work, 'resolve this work');
     if (work.state === 'RESOLVED') {
       throw new SwitchboardError('CONFLICT', `Work '${work.id}' is already resolved (${work.resolutionReason})`);
+    }
+    // C1: a requested stop is not a confirmed handoff. While an executor still
+    // owns active work, closing it would silently abandon partial results, so a
+    // recorded stop handoff must come first. Work with no executor has no
+    // partial state to preserve and may resolve directly.
+    if (work.stopRequestedAt && !work.stopHandoffAt && work.executorId) {
+      throw new SwitchboardError(
+        'CONFLICT',
+        `Work '${work.id}' has a pending stop request: record a stop handoff before resolution`,
+        { details: { workId: work.id, stopRequestedAt: work.stopRequestedAt } }
+      );
     }
     if (parsed.reason === 'COMPLETED' && !['SUBMITTED', 'REVIEW'].includes(work.state)) {
       throw new SwitchboardError(
@@ -1175,6 +1390,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'RESOLVED',
+      operationHash,
       toState: 'RESOLVED',
       resolutionReason: parsed.reason,
       reason: parsed.reason,
@@ -1201,8 +1417,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = ReopenWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'REOPENED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'reopen this work')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireCommissionerOrSteward(principal, work, 'reopen this work');
@@ -1218,6 +1439,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'REOPENED',
+      operationHash,
       toState: targetState,
       resolutionReason: null,
       reason: parsed.reason,
@@ -1237,8 +1459,13 @@ export class WorkService {
     this.requireWrite(principal);
     const parsed = ArchiveWorkSchema.parse(input);
     const projectId = principal.projectId;
+    const operationHash = await hashOperation({ eventType: 'ARCHIVED', workId: parsed.workId, input: { ...parsed, operationId: undefined } });
     const replay = await this.findEvent(projectId, parsed.operationId);
-    if (replay) return this.receiptFrom(replay, await this.loadWork(projectId, replay.workId), true);
+    if (replay) {
+      return await this.checkReplay(principal, replay, operationHash, (work) =>
+        this.requireCommissionerOrSteward(principal, work, 'archive this work')
+      );
+    }
 
     const work = await this.loadWork(projectId, parsed.workId);
     this.requireCommissionerOrSteward(principal, work, 'archive this work');
@@ -1256,6 +1483,7 @@ export class WorkService {
       operationId: parsed.operationId,
       expectedRevision: parsed.expectedRevision,
       eventType: 'ARCHIVED',
+      operationHash,
       toState: 'RESOLVED',
       resolutionReason: work.resolutionReason,
       reason: 'ARCHIVED',

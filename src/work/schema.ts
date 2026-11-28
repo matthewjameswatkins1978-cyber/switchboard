@@ -125,6 +125,24 @@ export const ArchiveWorkSchema = z.object({
   expectedRevision: z.number().int().min(1),
 });
 
+export const ReconciliationDecisionSchema = z.enum(['retained', 'reprioritised', 'combined', 'superseded', 'withdrawn', 'cancelled', 'referred']);
+
+export const ResolveReconciliationSchema = z.object({
+  workId: IdSchema,
+  operationId: OperationIdSchema,
+  expectedRevision: z.number().int().min(1),
+  decision: ReconciliationDecisionSchema,
+  note: z.string().max(1024).optional(),
+});
+
+export const TransferCommissionershipSchema = z.object({
+  workId: IdSchema,
+  operationId: OperationIdSchema,
+  expectedRevision: z.number().int().min(1),
+  toCommissionerId: IdSchema,
+  note: z.string().min(3).max(1024),
+});
+
 export const ProposeReleaseSchema = z.object({
   workId: IdSchema,
   operationId: OperationIdSchema,

@@ -62,6 +62,8 @@ describe('Work surfaces: MCP and HTTP', () => {
       'get_work',
       'get_work_board',
       'related_work',
+      'record_reconciliation',
+      'transfer_commissionership',
     ]) {
       expect(tools).toContain(name);
     }
